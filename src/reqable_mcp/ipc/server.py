@@ -203,7 +203,15 @@ class IpcServer:
 
     @staticmethod
     def _read_line(conn: socket.socket) -> bytes | None:
-        """Read one ``\\n``-terminated frame. None on EOF / oversized."""
+        """Read one ``\\n``-terminated frame.
+
+        Returns ``None`` on EOF / read error (caller should close the
+        connection without writing). When the frame grows past
+        ``MAX_MESSAGE_BYTES`` we return what we've read so far so
+        :func:`decode_message` raises :class:`InvalidMessage` and the
+        normal error response path runs — peer learns the request was
+        too large instead of seeing a silent EOF.
+        """
         buf = bytearray()
         while True:
             try:
@@ -216,7 +224,8 @@ class IpcServer:
             if b"\n" in chunk:
                 return bytes(buf)
             if len(buf) > MAX_MESSAGE_BYTES:
-                return None  # decode_message will reject if we returned it
+                # Return what we have; decode_message rejects on size.
+                return bytes(buf)
 
 
 __all__ = ["IpcServer", "Handler", "READ_TIMEOUT_S"]

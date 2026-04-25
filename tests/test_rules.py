@@ -211,9 +211,93 @@ class TestPersistence:
         # Confirm 0600 perms
         assert oct(path.stat().st_mode)[-3:] == "600"
 
+        # Auto-load on construction — no explicit load() needed.
         e2 = RuleEngine(path)
-        e2.load()
         assert [x.id for x in e2.list_all()] == [r.id]
+
+    def test_autoload_default_true(self, tmp_path: Path) -> None:
+        path = tmp_path / "rules.json"
+        e = RuleEngine(path)
+        e.add(kind="tag", side="request", payload={"color": "red"})
+        # Fresh instance should pick up persisted rules without load().
+        e2 = RuleEngine(path)
+        assert len(e2.list_all()) == 1
+
+    def test_autoload_can_be_disabled(self, tmp_path: Path) -> None:
+        path = tmp_path / "rules.json"
+        e = RuleEngine(path)
+        e.add(kind="tag", side="request", payload={"color": "red"})
+        e2 = RuleEngine(path, autoload=False)
+        assert e2.list_all() == []
+        e2.load()
+        assert len(e2.list_all()) == 1
+
+    def test_load_drops_corrupt_field_types(self, tmp_path: Path) -> None:
+        # rules.json with one good rule and one with bad ttl type.
+        path = tmp_path / "rules.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "rules": [
+                        {
+                            "id": "good",
+                            "kind": "tag",
+                            "side": "request",
+                            "host": None,
+                            "path_pattern": None,
+                            "method": None,
+                            "payload": {"color": "red"},
+                            "created_ts": 1000.0,
+                            "expires_ts": 9999999999.0,
+                            "hits": 0,
+                        },
+                        {
+                            "id": "bad",
+                            "kind": "tag",
+                            "side": "request",
+                            "host": None,
+                            "path_pattern": None,
+                            "method": None,
+                            "payload": {"color": "red"},
+                            "created_ts": "not a number",  # wrong type
+                            "expires_ts": None,
+                            "hits": 0,
+                        },
+                    ]
+                }
+            )
+        )
+        e = RuleEngine(path)
+        ids = [r.id for r in e.list_all()]
+        assert ids == ["good"]
+
+    def test_load_ignores_unknown_fields(self, tmp_path: Path) -> None:
+        # Forward-compat: a rule written by a future version that adds
+        # a new field should still be parseable.
+        path = tmp_path / "rules.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "rules": [
+                        {
+                            "id": "f",
+                            "kind": "tag",
+                            "side": "request",
+                            "host": None,
+                            "path_pattern": None,
+                            "method": None,
+                            "payload": {"color": "red"},
+                            "created_ts": 1000.0,
+                            "expires_ts": 9999999999.0,
+                            "hits": 0,
+                            "future_field_we_dont_know_about": "shrug",
+                        }
+                    ]
+                }
+            )
+        )
+        e = RuleEngine(path)
+        assert len(e.list_all()) == 1
 
     def test_load_drops_already_expired(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -306,8 +390,9 @@ class TestStats:
         )
         s = engine.stats()
         assert s["active"] == 3
-        assert s["by_kind.tag"] == 2
-        assert s["by_kind.inject_header"] == 1
+        assert s["by_kind"]["tag"] == 2
+        assert s["by_kind"]["inject_header"] == 1
+        assert "by_kind.tag" not in s, "stats should nest by_kind, not flatten"
 
 
 # ---------------------------------------------------------------- defaults

@@ -19,7 +19,7 @@ import lmdb
 
 from . import proxy_guard
 from .db import Database
-from .ipc.protocol import Request, ok_response
+from .ipc.protocol import Request, error_response, ok_response
 from .ipc.server import IpcServer
 from .paths import Paths, resolve
 from .rules import RuleEngine
@@ -124,8 +124,8 @@ class Daemon:
 
         # Phase 2: rule engine (always loaded so MCP tools can list/clear
         # rules even without IPC; addons can't talk to us without IPC).
+        # RuleEngine auto-loads on construction.
         self.rule_engine = RuleEngine(self.paths.our_rules_json)
-        self.rule_engine.load()
 
         if self.config.enable_ipc:
             self.ipc_server = IpcServer(
@@ -172,8 +172,6 @@ class Daemon:
 
         Unknown verbs return a 4xx-equivalent (``ok=false``).
         """
-        from .ipc.protocol import error_response  # avoid circular at import
-
         if self.rule_engine is None:
             return error_response("daemon not fully started")
 

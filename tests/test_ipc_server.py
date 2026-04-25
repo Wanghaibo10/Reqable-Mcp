@@ -126,6 +126,30 @@ class TestProtocolErrors:
         time.sleep(0.1)
         assert echo_server.stats()["invalid_total"] == before + 1
 
+    def test_oversized_frame_returns_error_not_silent_close(
+        self, echo_server: IpcServer
+    ) -> None:
+        # A frame just over the 256KB cap should produce a structured
+        # error response rather than a silent EOF — the previous
+        # behavior left the peer guessing why their request vanished.
+        from reqable_mcp.ipc.protocol import MAX_MESSAGE_BYTES
+
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(str(echo_server.socket_path))
+        # Big single chunk, no newline, intentionally bigger than the cap.
+        s.sendall(b"x" * (MAX_MESSAGE_BYTES + 100) + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        resp = json.loads(buf.split(b"\n", 1)[0])
+        assert resp["ok"] is False
+        assert "exceeds" in resp["error"] or "protocol error" in resp["error"]
+
 
 # ---------------------------------------------------------------- handler errors
 

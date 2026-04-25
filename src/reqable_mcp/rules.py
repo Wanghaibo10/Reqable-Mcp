@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 log = logging.getLogger(__name__)
 
@@ -121,9 +121,36 @@ class Rule:
         d.pop("_path_re", None)
         return d
 
+    # Type spec used by ``from_dict`` to reject corrupt persisted rows
+    # before they reach the dataclass constructor (which would silently
+    # accept e.g. ttl="not a number" until used). ClassVar so dataclass
+    # doesn't try to treat it as an instance field.
+    _FIELD_TYPES: ClassVar[dict[str, type | tuple[type, ...]]] = {
+        "id": str,
+        "kind": str,
+        "side": str,
+        "host": (str, type(None)),
+        "path_pattern": (str, type(None)),
+        "method": (str, type(None)),
+        "payload": dict,
+        "created_ts": (int, float),
+        "expires_ts": (int, float, type(None)),
+        "hits": int,
+    }
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Rule:
-        kwargs = {k: v for k, v in d.items() if k != "_path_re"}
+        if not isinstance(d, dict):
+            raise ValueError(f"rule entry must be a dict, got {type(d).__name__}")
+        # Validate known fields; ignore unknown ones (forward-compat with
+        # rules.json written by future versions).
+        for fname, ftypes in cls._FIELD_TYPES.items():
+            if fname in d and not isinstance(d[fname], ftypes):
+                raise ValueError(
+                    f"field {fname!r} has wrong type: "
+                    f"{type(d[fname]).__name__} (expected {ftypes})"
+                )
+        kwargs = {k: v for k, v in d.items() if k in cls._FIELD_TYPES}
         return cls(**kwargs)
 
 
@@ -151,15 +178,21 @@ class RuleEngine:
     so concurrent IPC handlers don't pile up.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, autoload: bool = True):
         self.path = Path(path)
         self._rules: dict[str, Rule] = {}
         self._lock = threading.Lock()
+        if autoload:
+            self.load()
 
     # ------------------------------------------------------------------ load/save
 
     def load(self) -> None:
-        """Restore rules from disk, dropping any that are already expired."""
+        """Restore rules from disk, dropping any that are already expired.
+
+        Idempotent — re-call to merge new on-disk rules into memory.
+        Called automatically from ``__init__`` unless ``autoload=False``.
+        """
         if not self.path.exists():
             return
         try:
@@ -309,7 +342,7 @@ class RuleEngine:
                 and r.matches(side=side, host=host, path=path, method=method)
             ]
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         with self._lock:
             now = time.time()
             active = [r for r in self._rules.values() if not r.is_expired(now=now)]
@@ -321,7 +354,7 @@ class RuleEngine:
                 "active": len(active),
                 "expired_pending_reap": len(self._rules) - len(active),
                 "total_hits": total_hits,
-                **{f"by_kind.{k}": v for k, v in by_kind.items()},
+                "by_kind": by_kind,
             }
 
 
