@@ -60,7 +60,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     from .sources.objectbox_meta import load_schema
     from .wait_queue import WaitQueue
 
-    daemon = Daemon(config=DaemonConfig(strict_proxy=args.strict_proxy))
+    # cmd_status is read-only; do NOT bind the IPC socket (a real
+    # `serve` may already own it).
+    daemon = Daemon(
+        config=DaemonConfig(strict_proxy=args.strict_proxy, enable_ipc=False)
+    )
     daemon.paths.assert_reqable_present()
     daemon.paths.ensure_our_dirs()
     env = lmdb.open(

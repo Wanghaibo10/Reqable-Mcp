@@ -43,11 +43,15 @@ class Paths:
     reqable_capture_dir: Path  # capture/, contains *-{req_raw|res-raw|res-extract}-body.reqable
     reqable_config_dir: Path
     reqable_capture_config: Path  # JSON file for scriptConfig (Phase 2 only)
+    reqable_script_environment: Path  # JSON file: {"executor":"python3",...}
     our_data: Path
     our_cache_db: Path
     our_log: Path
     our_state_json: Path
-    our_socket: Path  # Phase 2 IPC socket
+    our_socket: Path  # Phase 2 IPC socket (daemon ↔ addons.py)
+    our_rules_json: Path  # Phase 2 rule store
+    our_hook_dir: Path  # Phase 2 deployed addons.py / main.py / reqable.py
+    our_backup_dir: Path  # Phase 2 capture_config.{ts}.bak
 
     def assert_reqable_present(self) -> None:
         """Raise FileNotFoundError if Reqable's data dir is missing.
@@ -92,9 +96,13 @@ def resolve(
         reqable_capture_dir=rs / "capture",
         reqable_config_dir=rs / "config",
         reqable_capture_config=rs / "config" / "capture_config",
+        reqable_script_environment=rs / "config" / "script_environment",
         our_data=od,
         our_cache_db=od / "cache.db",
         our_log=od / "daemon.log",
         our_state_json=od / "state.json",
         our_socket=od / "daemon.sock",
+        our_rules_json=od / "rules.json",
+        our_hook_dir=od / "hook",
+        our_backup_dir=od / "backup",
     )

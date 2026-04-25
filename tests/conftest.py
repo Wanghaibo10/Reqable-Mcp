@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -40,3 +43,21 @@ def real_lmdb_required(reqable_lmdb_path: Path | None) -> Path:
             "Reqable installed and used at least once"
         )
     return reqable_lmdb_path
+
+
+@pytest.fixture
+def short_data_dir() -> Iterator[Path]:
+    """A short-path tmp dir for places that need ``AF_UNIX``-safe paths.
+
+    macOS caps Unix-socket paths at 104 bytes; pytest's default
+    ``tmp_path`` (under ``/private/var/folders/...``) is too long once
+    you append a daemon ``our_data/daemon.sock``. Tests that start the
+    Daemon (which now binds an IPC socket by default) should use this
+    instead of ``tmp_path``.
+    """
+    p = Path("/tmp") / f"rmcp-test-{uuid.uuid4().hex[:8]}"
+    p.mkdir(mode=0o700, exist_ok=False)
+    try:
+        yield p
+    finally:
+        shutil.rmtree(p, ignore_errors=True)

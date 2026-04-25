@@ -16,11 +16,12 @@ from reqable_mcp.paths import resolve
 
 
 @pytest.fixture
-def daemon(real_lmdb_required: Path, tmp_path: Path):
+def daemon(real_lmdb_required: Path, short_data_dir: Path):
     # real_lmdb_required points at .../com.reqable.macosx/box; we need
-    # the parent (the support dir).
+    # the parent (the support dir). short_data_dir keeps the IPC socket
+    # path under macOS's 104-byte AF_UNIX limit.
     support = real_lmdb_required.parent
-    paths = resolve(reqable_support=support, our_data=tmp_path / "data")
+    paths = resolve(reqable_support=support, our_data=short_data_dir)
     # Don't crash this test on user's actual proxy state.
     os.environ.pop("REQABLE_MCP_STRICT_PROXY", None)
     d = Daemon(paths=paths, config=DaemonConfig(strict_proxy=False))

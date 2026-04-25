@@ -19,7 +19,10 @@ import lmdb
 
 from . import proxy_guard
 from .db import Database
+from .ipc.protocol import Request, ok_response
+from .ipc.server import IpcServer
 from .paths import Paths, resolve
+from .rules import RuleEngine
 from .sources.body_source import BodySource
 from .sources.lmdb_source import LmdbSource
 from .sources.objectbox_meta import Entity, load_schema
@@ -35,6 +38,10 @@ class DaemonConfig:
     strict_proxy: bool | None = None
     """``True`` exits if a third-party proxy is detected. ``None``
     falls back to the ``REQABLE_MCP_STRICT_PROXY`` env var."""
+
+    enable_ipc: bool = True
+    """Whether to start the Phase 2 IPC server. Tests / cmd_status
+    can disable to avoid binding the socket file."""
 
 
 class Daemon:
@@ -55,6 +62,8 @@ class Daemon:
         self.body_source: BodySource | None = None
         self.lmdb_source: LmdbSource | None = None
         self.wait_queue: WaitQueue | None = None
+        self.rule_engine: RuleEngine | None = None
+        self.ipc_server: IpcServer | None = None
         self.schema: dict[str, Entity] = {}
         self._started = False
 
@@ -113,11 +122,23 @@ class Daemon:
         )
         self.lmdb_source.start()
 
+        # Phase 2: rule engine (always loaded so MCP tools can list/clear
+        # rules even without IPC; addons can't talk to us without IPC).
+        self.rule_engine = RuleEngine(self.paths.our_rules_json)
+        self.rule_engine.load()
+
+        if self.config.enable_ipc:
+            self.ipc_server = IpcServer(
+                self.paths.our_socket, self._handle_ipc_request
+            )
+            self.ipc_server.start()
+
         self._started = True
         log.info(
-            "reqable-mcp daemon started — cache=%s lmdb=%s",
+            "reqable-mcp daemon started — cache=%s lmdb=%s ipc=%s",
             self.paths.our_cache_db,
             self.paths.reqable_lmdb_dir,
+            self.paths.our_socket if self.config.enable_ipc else "disabled",
         )
 
     # ------------------------------------------------------------------ stop
@@ -125,6 +146,11 @@ class Daemon:
     def stop(self) -> None:
         if not self._started:
             return
+        if self.ipc_server is not None:
+            try:
+                self.ipc_server.stop()
+            except Exception:
+                log.exception("ipc_server.stop failed")
         if self.lmdb_source is not None:
             try:
                 self.lmdb_source.stop()
@@ -132,6 +158,41 @@ class Daemon:
                 log.exception("lmdb_source.stop failed")
         self._started = False
         log.info("reqable-mcp daemon stopped")
+
+    # ------------------------------------------------------------------ ipc
+
+    def _handle_ipc_request(self, req: Request) -> bytes:
+        """Dispatch an addons.py IPC request.
+
+        Verbs:
+          * ``get_rules`` — return rules to apply for one in-flight
+            request/response. args: ``{side, host, path, method}``.
+          * ``report_hit`` — addons confirms it applied a rule.
+            args: ``{rule_ids: [...]}``.
+
+        Unknown verbs return a 4xx-equivalent (``ok=false``).
+        """
+        from .ipc.protocol import error_response  # avoid circular at import
+
+        if self.rule_engine is None:
+            return error_response("daemon not fully started")
+
+        if req.op == "get_rules":
+            args = req.args
+            rules = self.rule_engine.match_for(
+                side=args.get("side", ""),
+                host=args.get("host"),
+                path=args.get("path"),
+                method=args.get("method"),
+            )
+            return ok_response([r.to_addon_payload() for r in rules])
+
+        if req.op == "report_hit":
+            for rid in req.args.get("rule_ids") or []:
+                self.rule_engine.record_hit(str(rid))
+            return ok_response({})
+
+        return error_response(f"unknown op: {req.op}")
 
     # ------------------------------------------------------------------ status
 
@@ -156,6 +217,8 @@ class Daemon:
                 else None
             ),
             "schema_entities": sorted(self.schema.keys()) if self.schema else [],
+            "rules": self.rule_engine.stats() if self.rule_engine else None,
+            "ipc": self.ipc_server.stats() if self.ipc_server else None,
         }
 
 

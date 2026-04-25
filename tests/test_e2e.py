@@ -20,15 +20,16 @@ from reqable_mcp.paths import resolve
 
 
 @pytest.fixture
-def live_daemon(real_lmdb_required: Path, tmp_path: Path):
+def live_daemon(real_lmdb_required: Path, short_data_dir: Path):
     """A *real* daemon — background poller running, not the
     test-only no-thread variant. Closer to production.
 
     We let the background poller do the initial scan instead of
     calling scan_once ourselves; calling both racs the SQLite writer.
+    Uses short_data_dir to keep the IPC socket path under 104 bytes.
     """
     support = real_lmdb_required.parent
-    paths = resolve(reqable_support=support, our_data=tmp_path / "data")
+    paths = resolve(reqable_support=support, our_data=short_data_dir)
     d = Daemon(paths=paths, config=DaemonConfig(strict_proxy=False))
     d.start()
     set_daemon(d)

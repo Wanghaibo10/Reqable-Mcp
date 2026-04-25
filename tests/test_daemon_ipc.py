@@ -1,0 +1,161 @@
+"""End-to-end: install rule via Daemon's RuleEngine, then have a
+client speak the IPC protocol the way addons.py will.
+
+This is the seam where M11 (IPC + rules + daemon wiring) actually
+matters; unit tests for each piece pass in isolation but only this
+test catches a wiring mistake.
+"""
+
+from __future__ import annotations
+
+import json
+import socket
+import time
+from pathlib import Path
+
+import pytest
+
+from reqable_mcp.daemon import Daemon, DaemonConfig
+from reqable_mcp.ipc.protocol import PROTOCOL_VERSION, encode_message
+from reqable_mcp.paths import resolve
+
+
+def _round_trip(sock_path: Path, payload: dict, timeout: float = 2.0) -> dict:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(str(sock_path))
+    s.sendall(encode_message(payload))
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    return json.loads(buf.split(b"\n", 1)[0])
+
+
+@pytest.fixture
+def started_daemon(real_lmdb_required: Path, short_data_dir: Path):
+    """A daemon with IPC enabled, ready to take addons-side calls."""
+    support = real_lmdb_required.parent
+    paths = resolve(reqable_support=support, our_data=short_data_dir)
+    d = Daemon(paths=paths, config=DaemonConfig(strict_proxy=False))
+    d.start()
+    yield d
+    d.stop()
+
+
+def test_get_rules_empty_initially(started_daemon: Daemon) -> None:
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {
+            "v": PROTOCOL_VERSION,
+            "op": "get_rules",
+            "args": {
+                "side": "request",
+                "host": "api.example.com",
+                "path": "/login",
+                "method": "POST",
+            },
+        },
+    )
+    assert resp == {"ok": True, "data": []}
+
+
+def test_install_rule_then_get_returns_addon_payload(started_daemon: Daemon) -> None:
+    assert started_daemon.rule_engine is not None
+    rule = started_daemon.rule_engine.add(
+        kind="inject_header",
+        side="request",
+        host="api.example.com",
+        payload={"name": "X-Test", "value": "1"},
+    )
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {
+            "v": PROTOCOL_VERSION,
+            "op": "get_rules",
+            "args": {
+                "side": "request",
+                "host": "api.example.com",
+                "path": "/x",
+                "method": "GET",
+            },
+        },
+    )
+    assert resp["ok"] is True
+    assert resp["data"] == [
+        {"id": rule.id, "kind": "inject_header", "name": "X-Test", "value": "1"}
+    ]
+
+
+def test_get_rules_filters_by_host(started_daemon: Daemon) -> None:
+    assert started_daemon.rule_engine is not None
+    started_daemon.rule_engine.add(
+        kind="tag",
+        side="request",
+        host="a.example.com",
+        payload={"color": "red"},
+    )
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {
+            "v": PROTOCOL_VERSION,
+            "op": "get_rules",
+            "args": {
+                "side": "request",
+                "host": "b.example.com",  # doesn't match
+                "path": "/",
+                "method": "GET",
+            },
+        },
+    )
+    assert resp == {"ok": True, "data": []}
+
+
+def test_report_hit_increments_counter(started_daemon: Daemon) -> None:
+    assert started_daemon.rule_engine is not None
+    rule = started_daemon.rule_engine.add(
+        kind="tag",
+        side="request",
+        payload={"color": "red"},
+    )
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {
+            "v": PROTOCOL_VERSION,
+            "op": "report_hit",
+            "args": {"rule_ids": [rule.id]},
+        },
+    )
+    assert resp == {"ok": True, "data": {}}
+    # Daemon-side state mutates synchronously (handler returned ok).
+    assert started_daemon.rule_engine.list_all()[0].hits == 1
+
+
+def test_unknown_op_returns_error(started_daemon: Daemon) -> None:
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {"v": PROTOCOL_VERSION, "op": "definitely_unknown", "args": {}},
+    )
+    assert resp["ok"] is False
+    assert "unknown op" in resp["error"]
+
+
+def test_status_reports_ipc_and_rules(started_daemon: Daemon) -> None:
+    assert started_daemon.rule_engine is not None
+    started_daemon.rule_engine.add(
+        kind="tag",
+        side="request",
+        payload={"color": "red"},
+    )
+    # Drive one request so connection counter ticks up.
+    _round_trip(
+        started_daemon.paths.our_socket,
+        {"v": PROTOCOL_VERSION, "op": "get_rules", "args": {"side": "request"}},
+    )
+    time.sleep(0.05)
+    status = started_daemon.status()
+    assert status["rules"]["active"] == 1
+    assert status["ipc"]["connections_total"] >= 1

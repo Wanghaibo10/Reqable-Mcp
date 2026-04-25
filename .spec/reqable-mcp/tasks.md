@@ -231,22 +231,236 @@
 
 ---
 
-## Phase 2 任务(MVP 验收 + 1 周稳定运行后)
+## Phase 2 — 写回与改流量(主体,基于实测 Reqable SDK)
 
-- [ ] P2.1 `addon/main.py` + `addon/addons.py` — Reqable 脚本入口,含规则应用 + 反向写
-- [ ] P2.2 `src/reqable_mcp/sources/hook_source.py` — IPC server,接 addons 推送的 hit 事件
-- [ ] P2.3 `src/reqable_mcp/rules.py` — 规则引擎(tag/modify/mock/block),`rules.json` 原子写
-- [ ] P2.4 `src/reqable_mcp/tools/tag.py` — `tag_pattern / untag_pattern / comment_request / list_tags`
-- [ ] P2.5 `src/reqable_mcp/tools/modify.py` — `mock_response / block / replace_body / inject_header / replace_field`
-- [ ] P2.6 install.sh 增加 hook 启用流程:
-  - 检测 Reqable 已退出 → 否则提示用户先关
-  - 创建 `scripts/exec/<NEW_UUID>/` + 复制 main.py/addons.py/reqable.py
-  - 备份 capture_config → 修改 `scriptConfig.scripts/isEnabled` → 写回
-- [ ] P2.7 uninstall.sh 加还原 capture_config 步骤
-- [ ] P2.8 端到端测试 hook 链路:Claude 调 tag_pattern → addons 应用规则 → Reqable UI 显示颜色
+> **背景** — Reqable 的 Python 脚本扩展点已经从本机 `scripts/exec/{uuid}/`
+> 完整摸清:`reqable.py`(SDK)+ `main.py`(入口)+ `addons.py`(用户脚本)。
+> Hook 入口为 `onRequest(context, request)` 与 `onResponse(context, response)`,
+> 全部字段(method/path/queries/headers/body/code)可读可写。`context` 暴露
+> `highlight`(7 色枚举)/ `comment` / `env`(跨 capture 持久 dict)/ `shared`
+> (单次 onReq→onResp 共享)。
+>
+> **执行模型** — Reqable 对每个请求 fork 一个 Python 进程跑 main.py,
+> 通过 `request.bin`(JSON in)→ `request.bin.cb`(JSON out)与脚本通信。
+> 冷启动 ≈ 200ms,所以**所有规则匹配/状态都放在 daemon**,addons 只做
+> "查询规则 + 应用 + 上报 hit"的薄壳。
+>
+> **依赖顺序的考量** — 先做 daemon 端 IPC(M11),再写 addons 模板能脱机
+> 跑(M12),最后才动 Reqable 配置(M13)。这样 M11/M12 完全在我们项目
+> 内可测,直到 M13 才有真实副作用。
 
-## Phase 3 任务(可选)
+### 配置与文件路径
 
-- [ ] P3.1 `src/reqable_mcp/tools/export.py` — `dump_body / export_har / decode_body / prettify`
-- [ ] P3.2 `replay_request(uid, modifications)` — 重发请求(用 stdlib `urllib`,严格 bypass 系统代理)
-- [ ] P3.3 FTS5 增量索引 body(优化 search_body 大数据量性能)
+| 用途 | 路径 |
+|---|---|
+| Reqable 主配置(要改) | `~/Library/Application Support/com.reqable.macosx/config/capture_config` |
+| 脚本环境配置 | `~/Library/Application Support/com.reqable.macosx/config/script_environment` |
+| 脚本部署目录(我们写) | `~/.reqable-mcp/hook/` |
+| daemon IPC socket | `~/.reqable-mcp/daemon.sock` |
+| 规则持久化文件 | `~/.reqable-mcp/rules.json` |
+| 备份 | `~/.reqable-mcp/backup/capture_config.{ts}.bak` |
+
+### M11 — daemon IPC(纯本地,不动 Reqable)
+
+依赖:MVP
+
+- [ ] 11.1 `src/reqable_mcp/ipc/protocol.py`
+  - line-delimited JSON over Unix socket
+  - 请求:`{"v":1,"op":"<get_rules|report_hit>","args":{...}}`
+  - 响应:`{"ok":true,"data":...}` 或 `{"ok":false,"error":"..."}`
+  - 单次 round-trip,无长连接(addons 进程短命)
+- [ ] 11.2 `src/reqable_mcp/ipc/server.py`
+  - `class IpcServer(socket_path, rule_engine, on_hit)`
+  - `start()` — 启 listener thread + 每连接一个短 handler thread
+  - 5s 读超时 → 关连接(防 addons 卡死后挂死 daemon)
+  - 子进程崩 / 半包 → 静默 close,不影响主循环
+- [ ] 11.3 `src/reqable_mcp/rules.py`
+  - `@dataclass Rule(id, kind, host_pattern, path_pattern, side, action_payload, ttl_s, created_ts, hits)`
+  - `kind ∈ {tag, comment, inject_header, replace_body, mock, block}`
+  - `class RuleEngine`:`add / remove / list / match(context_dict) → list[Rule]`
+  - 持久化:`rules.json` 原子写(tempfile + os.replace)
+  - 启动加载,过期项 sweep
+- [ ] 11.4 `Daemon.start()` 接入 IpcServer + RuleEngine
+  - socket 文件 0600 perm,启动前 unlink
+  - 退出时 stop + unlink
+- [ ] 11.5 测试:`tests/test_ipc.py` / `tests/test_rules.py`
+  - 启 server → 客户端发 `get_rules` → 验响应
+  - rule TTL 过期自动剔除
+  - 并发多 connection 不互相阻塞
+
+### M12 — addons 模板(脚本生成,不动 Reqable)
+
+依赖:M11
+
+- [ ] 12.1 `src/reqable_mcp/hook/template/main.py` — copy from
+  `scripts/exec/{uuid}/main.py`(reqable 官方逻辑)逐字保留
+- [ ] 12.2 `src/reqable_mcp/hook/template/reqable.py` — copy from 官方
+- [ ] 12.3 `src/reqable_mcp/hook/template/addons.py` — 我们的薄壳:
+  ```python
+  from reqable import *
+  import os, json, socket
+  SOCK = os.path.expanduser("~/.reqable-mcp/daemon.sock")
+
+  def _ask(side, ctx, msg):
+      try:
+          s = socket.socket(socket.AF_UNIX); s.settimeout(0.3); s.connect(SOCK)
+          s.sendall((json.dumps({
+              "v":1,"op":"get_rules",
+              "args":{"side":side,"host":ctx.host,"path":msg.path if side=="request" else msg.request.path,
+                      "method":msg.method if side=="request" else msg.request.method}
+          })+"\n").encode())
+          buf = b""; 
+          while b"\n" not in buf: buf += s.recv(4096)
+          s.close()
+          return json.loads(buf.split(b"\n",1)[0]).get("data",[])
+      except Exception:
+          return []  # fail-open
+
+  def _apply(rules, ctx, msg, side):
+      hits = []
+      for r in rules:
+          k = r["kind"]
+          if k == "tag":           ctx.highlight = Highlight[r["color"]]
+          elif k == "comment":     ctx.comment = r["text"]
+          elif k == "inject_header": msg.headers[r["name"]] = r["value"]
+          elif k == "replace_body":  msg.body = r["body"]
+          elif side == "response" and k == "mock":
+              msg.code = r["status"]; msg.body = r["body"]
+              for h, v in (r.get("headers") or {}).items(): msg.headers[h] = v
+          elif side == "request" and k == "block":
+              # block 暂用空响应短路 — 由 M13 实测语义后定稿
+              raise RuntimeError("blocked by reqable-mcp rule "+r["id"])
+          hits.append(r["id"])
+      return hits
+
+  def _report(hits, ctx, side):
+      if not hits: return
+      try:
+          s = socket.socket(socket.AF_UNIX); s.settimeout(0.3); s.connect(SOCK)
+          s.sendall((json.dumps({"v":1,"op":"report_hit",
+              "args":{"side":side,"uid":ctx.uid,"rule_ids":hits}})+"\n").encode())
+          s.close()
+      except Exception:
+          pass
+
+  def onRequest(context, request):
+      hits = _apply(_ask("request", context, request), context, request, "request")
+      _report(hits, context, "request")
+      return request
+
+  def onResponse(context, response):
+      hits = _apply(_ask("response", context, response), context, response, "response")
+      _report(hits, context, "response")
+      return response
+  ```
+- [ ] 12.4 `src/reqable_mcp/hook/deploy.py`
+  - `deploy_to(target_dir: Path)` — 把模板拷到 `~/.reqable-mcp/hook/`
+  - 幂等:存在则 diff;同则跳过,不同则覆盖
+- [ ] 12.5 测试:`tests/test_hook_deploy.py`(纯文件操作)
+- [ ] 12.6 脱机端到端:手工跑 `python3 hook/main.py request hook/template/sample_request.bin`
+  → 验证 cb 文件生成 + 内容符合预期
+
+### M13 — install_hook(动 Reqable 配置,可逆)
+
+依赖:M11、M12
+
+- [ ] 13.1 `install_hook.sh` 流程:
+  1. **前置检查**:
+     - `pgrep -x Reqable` → 有则要求用户退出(`-f` 跳过仅 dev 用)
+     - 检查我们 daemon `pid file` 在跑
+     - 提示"是否需要 Reqable Pro"(实测后定;若需要,Pro 未授权时退出)
+  2. 备份 `capture_config` → `~/.reqable-mcp/backup/capture_config.{ts}.bak`
+  3. 调 `M12.4 deploy_to(~/.reqable-mcp/hook/)`
+  4. Python 修改 `capture_config`(原子写):
+     - `scriptConfig.scripts = [{"id":"reqable-mcp","name":"reqable-mcp","path":"<HOOK_DIR>","enabled":true}]`(实际字段需读已有结构对齐)
+     - `scriptConfig.isEnabled = true`
+     - `scriptConfig.execHome` 指向 hook 目录
+  5. 修改 `script_environment` → `{"executor":"<我们 venv 的 python3 绝对路径>","version":"3.13.x","home":""}`
+  6. 提示用户重启 Reqable
+- [ ] 13.2 `uninstall_hook.sh`:
+  - 从 `scriptConfig.scripts` 删 reqable-mcp 项;空则置 isEnabled=false
+  - 还原 `script_environment`(用 backup)
+  - **不**删 `~/.reqable-mcp/hook/`(便于排查)
+- [ ] 13.3 实测确认 hook 语义:
+  - `onRequest` 内 `raise` → Reqable 是否丢弃 / 502 / 透传?(决定 block 实现)
+  - `onResponse` 改 code + body → UI / 上游真生效?
+  - 多脚本同时启用时执行顺序?
+- [ ] 13.4 `tests/test_install_hook.py`(用 fixture capture_config,断言 diff)
+
+### M14 — 标记类 MCP 工具(Tier 2)
+
+依赖:M11、M13
+
+- [ ] 14.1 `src/reqable_mcp/tools/tag.py`
+  - `tag_pattern(host=, path_pattern=, color=, ttl_seconds=300) → rule_id`
+  - `comment_pattern(host=, path_pattern=, text=, ttl_seconds=300) → rule_id`
+  - `untag(rule_id)` / `clear_tags()`
+  - `list_rules(kind?=)` — 含 hit 计数
+- [ ] 14.2 测试:`tests/test_tools_tag.py`(规则注册 → addons hit 模拟 → 验 db 中 capture 行 highlight 字段被更新)
+
+### M15 — 改包类 MCP 工具(Tier 3,危险)
+
+依赖:M14、M13.3 实测结果
+
+- [ ] 15.1 `src/reqable_mcp/tools/modify.py`
+  - `inject_header(host_pattern, name, value, side="request"|"response", ttl_seconds=300)`
+  - `replace_body(host_pattern, body, side, ttl_seconds=300)`
+  - `mock_response(host_pattern, status, body, headers={}, ttl_seconds=300)` — 只在 onResponse 生效;不发往源(语义需 M13.3 确认)
+  - `block_request(host_pattern, ttl_seconds=300)`
+  - **强制 TTL** — 默认 300s,最大 3600s。MCP 工具拒绝 ttl=∞
+  - 工具描述里写明"会真实修改流量,5 分钟后自动失效"
+- [ ] 15.2 `panic_button` MCP 工具:`disable_all_rules()` — 一键全停
+- [ ] 15.3 测试:`tests/test_tools_modify.py`
+
+### M16 — 规则管理 + 安全护栏
+
+依赖:M14、M15
+
+- [ ] 16.1 daemon 启动时扫一次 rules.json,清掉过期的
+- [ ] 16.2 后台 reaper 每 30s 清过期规则
+- [ ] 16.3 `status` 工具增加 `active_rules` / `rule_hits_total` 字段
+- [ ] 16.4 hook 模板的 `_ask` 失败计数:连续 N 次 timeout → daemon 在 stderr warn(可能 daemon 死了,Reqable 还开着 hook)
+- [ ] 16.5 `panic_button` 也走 IPC,addons.py 启动后第一件事就拉 rule list — 清空就立刻不再注入
+
+---
+
+## Phase 3 — 增值工具(可选,Phase 2 落地后)
+
+### M17 — 重放与导出
+
+依赖:M11(用 IPC 通知 hit?可选)
+
+- [ ] 17.1 `src/reqable_mcp/tools/replay.py`
+  - `replay_request(uid, modifications={...})` — stdlib `urllib.request`,严格设
+    `OpenerDirector` + `ProxyHandler({})` 旁路所有代理
+  - 返回新响应的 status / headers / body
+  - 不写回 LMDB(我们的 db 仍只读),仅返回给调用者
+- [ ] 17.2 `src/reqable_mcp/tools/export.py`
+  - `dump_body(uid, side="req"|"res", path)` — 写到本地文件
+  - `export_har(uids|host|window, path)` — HAR 1.2 格式
+  - `decode_body(uid, side)` — gzip/br/deflate/zstd 解码
+  - `prettify(uid, side)` — JSON / XML / HTML 格式化
+
+### M18 — 自动 token 中继(SDK env 字段杀手锏)
+
+依赖:M11
+
+- [ ] 18.1 `auto_token_relay(source_host, source_field, target_host, target_header, ttl_seconds)`
+  - 注册一条特殊规则:onResponse 时如果 host=source_host,
+    从 body/header 提取 source_field → 写入 `context.env["_relay_<name>"]`
+  - onRequest 时如果 host=target_host,从 env 读 → 注入 target_header
+  - 这是 Reqable SDK `context.env` 跨 capture 持久的实际应用
+
+### M19 — body 全文检索增量化
+
+- [ ] 19.1 FTS5 索引 body(可配置开关,默认关 — 节省 SQLite 空间)
+- [ ] 19.2 `search_body` 大数据量下走 FTS5,fallback 现有线性扫描
+
+---
+
+## Phase 4 — 想象空间(用户提需求再定)
+
+- [ ] 自动 highlight 4xx/5xx / 慢请求(>1s)
+- [ ] multipart 改包(改上传文件)
+- [ ] capture 数据回溯导出 mitmproxy flow 格式
+- [ ] 规则 dry-run 模式(只 log 不真改)
