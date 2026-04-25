@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtualenvs
+.venv/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Project runtime data
+*.db
+*.db-wal
+*.db-shm
+*.sock
+*.pid
+*.log
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store

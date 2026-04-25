@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reqable-mcp"
+version = "0.1.0a1"
+description = "Local MCP server that exposes Reqable's captured HTTP/HTTPS traffic to Claude Code via read-only LMDB access."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "reqable-mcp contributors" }]
+keywords = ["mcp", "reqable", "http", "proxy", "claude", "anthropic"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+  "lmdb>=1.4,<2.0",
+  "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "mypy>=1.8",
+]
+
+[project.scripts]
+reqable-mcp = "reqable_mcp.__main__:main"
+
+[project.urls]
+Spec = "https://github.com/reqable-mcp/reqable-mcp/tree/main/.spec/reqable-mcp"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["reqable_mcp*"]
+
+[tool.setuptools.package-data]
+reqable_mcp = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]  # 超长由格式化器处理
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
