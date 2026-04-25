@@ -2,13 +2,13 @@
 # reqable-mcp uninstaller — reverses install.sh.
 #
 # Touches ONLY:
-#   * ~/.claude/mcp.json (removes the "reqable" entry)
+#   * ~/.claude.json (removes the "reqable" entry, leaves rest intact)
 #   * ~/.reqable-mcp/    (deletes; user data + cache)
 # Never touches any Reqable file.
 
 set -euo pipefail
 
-CLAUDE_MCP_JSON="${HOME}/.claude/mcp.json"
+CLAUDE_MCP_JSON="${HOME}/.claude.json"
 DATA_DIR="${HOME}/.reqable-mcp"
 
 echo "==> reqable-mcp uninstaller"
@@ -22,7 +22,7 @@ if [[ -f "$CLAUDE_MCP_JSON" ]]; then
     echo "    no python3; please remove the entry manually" >&2
   else
     MCP_JSON="$CLAUDE_MCP_JSON" "$PY" - <<'PY'
-import json, os, sys
+import json, os, sys, tempfile
 path = os.environ["MCP_JSON"]
 try:
     with open(path) as f:
@@ -34,9 +34,11 @@ if isinstance(servers, dict) and "reqable" in servers:
     del servers["reqable"]
     if not servers:
         del data["mcpServers"]
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    parent = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".claude.json.")
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     print("    entry removed")
 else:

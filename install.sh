@@ -17,7 +17,9 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_MCP_JSON="${HOME}/.claude/mcp.json"
+# Claude Code stores MCP config in ~/.claude.json (NOT ~/.claude/mcp.json,
+# which used to be the doc'd path but is no longer read).
+CLAUDE_MCP_JSON="${HOME}/.claude.json"
 DATA_DIR="${HOME}/.reqable-mcp"
 
 echo "==> reqable-mcp installer"
@@ -82,7 +84,7 @@ chmod 700 "$DATA_DIR" || true
 mkdir -p "$(dirname "$CLAUDE_MCP_JSON")"
 
 REGISTER_PY=$(cat <<'PY'
-import json, os, sys
+import json, os, sys, tempfile
 path = os.environ["MCP_JSON"]
 binary = os.environ["BIN"]
 data = {}
@@ -91,8 +93,10 @@ if os.path.exists(path):
         with open(path) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        print(f"warning: existing {path} unreadable; rewriting", file=sys.stderr)
-        data = {}
+        print(f"warning: existing {path} unreadable; refusing to overwrite "
+              "(would clobber unrelated Claude Code config). Fix the file "
+              "and re-run.", file=sys.stderr)
+        sys.exit(1)
 servers = data.setdefault("mcpServers", {})
 existing = servers.get("reqable")
 desired = {"command": binary, "args": ["serve"]}
@@ -100,9 +104,12 @@ if existing == desired:
     print("    already registered, no change")
     sys.exit(0)
 servers["reqable"] = desired
-tmp = path + ".tmp"
-with open(tmp, "w") as f:
+# Atomic write, preserve the 0600 perms Claude Code uses.
+parent = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=parent, prefix=".claude.json.")
+with os.fdopen(fd, "w") as f:
     json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 print(f"    wrote {path}")
 PY
