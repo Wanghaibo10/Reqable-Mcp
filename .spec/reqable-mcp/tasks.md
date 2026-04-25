@@ -364,28 +364,62 @@
 
 依赖:M11、M12
 
-- [ ] 13.1 `install_hook.sh` 流程:
-  1. **前置检查**:
-     - `pgrep -x Reqable` → 有则要求用户退出(`-f` 跳过仅 dev 用)
-     - 检查我们 daemon `pid file` 在跑
-     - 提示"是否需要 Reqable Pro"(实测后定;若需要,Pro 未授权时退出)
-  2. 备份 `capture_config` → `~/.reqable-mcp/backup/capture_config.{ts}.bak`
-  3. 调 `M12.4 deploy_to(~/.reqable-mcp/hook/)`
-  4. Python 修改 `capture_config`(原子写):
-     - `scriptConfig.scripts = [{"id":"reqable-mcp","name":"reqable-mcp","path":"<HOOK_DIR>","enabled":true}]`(实际字段需读已有结构对齐)
-     - `scriptConfig.isEnabled = true`
-     - `scriptConfig.execHome` 指向 hook 目录
-  5. 修改 `script_environment` → `{"executor":"<我们 venv 的 python3 绝对路径>","version":"3.13.x","home":""}`
-  6. 提示用户重启 Reqable
-- [ ] 13.2 `uninstall_hook.sh`:
-  - 从 `scriptConfig.scripts` 删 reqable-mcp 项;空则置 isEnabled=false
-  - 还原 `script_environment`(用 backup)
-  - **不**删 `~/.reqable-mcp/hook/`(便于排查)
-- [ ] 13.3 实测确认 hook 语义:
-  - `onRequest` 内 `raise` → Reqable 是否丢弃 / 502 / 透传?(决定 block 实现)
-  - `onResponse` 改 code + body → UI / 上游真生效?
-  - 多脚本同时启用时执行顺序?
-- [ ] 13.4 `tests/test_install_hook.py`(用 fixture capture_config,断言 diff)
+- [x] 13.1 `install_hook.sh` 流程(完成,但 hook 没被 Reqable 调用,见 13.5)
+- [x] 13.2 `uninstall_hook.sh`(完成 + 实测验证还原)
+- [x] 13.4 单元测试 16 个(纯 fixture)
+
+#### 13.5 实装失败的根因 — 真 schema 比预想复杂
+
+**实测发现**(2026-04-25,Reqable 3.0.40 在本机 macOS):
+
+我们的 `install-hook` 写入 `capture_config.scriptConfig.scripts[0]` 一条
+带 `path` 字段指向 `~/.reqable-mcp/hook/` 的条目,期待 Reqable 启动后
+fork python3 跑那个目录里的 main.py。**实际行为**:
+
+* Reqable **接受**了我们的 schema(配置项保留,没回滚)。
+* 但**从不调用** hook(daemon `connections_total` 始终为 0,`scripts/exec/`
+  没有新 uuid 目录,Reqable 日志里没有 reqable-mcp 相关条目)。
+* `script_environment` 被 Reqable 启动时**强制重写**为内置默认值
+  (`{"executor": "python3", "version": "3.9.6", "home": ""}`),
+  说明 Reqable 主动 detect Python,会忽略我们指定的 venv executor。
+
+**根因**(从 Reqable 二进制 strings + LMDB schema 反推):
+
+1. `UserScriptTemplateEntity` 的 schema 是 `{id, timestamp, name, script}`,
+   其中 `script` 字段是 PROP_STRING(type=9)—— **Reqable 把 Python
+   源码直接存在 LMDB 里**,不是文件路径。
+2. `~/Library/.../scripts/exec/{uuid}/` 是 Reqable **运行时**临时建的:
+   每次 fork 前从 LMDB UserScriptTemplate.script 读源码,写到 addons.py,
+   附上内置 main.py + reqable.py,再 fork。执行完目录可能被删(也可能
+   遗留作历史,本机有 2025 年的旧 uuid 目录)。
+3. `capture_config.scriptConfig.scripts[]` 的每项是**引用** template
+   的 id,字段大概是 `scriptId`(strings 里有 `scriptId`)。
+   `path` 字段我们填了但 Reqable 忽略 —— 它只在 `execHome`(根目录)用,
+   不针对单个 script。
+
+**这违反了 MVP 原始硬约束**:"绝对不向 Reqable LMDB 写入"
+(spec.md "强约束"段)。要让 hook 真正运行,必须在 LMDB 加一条
+UserScriptTemplate 行,或绕过这个机制。
+
+#### 13.6 后续路径(三选一,需用户决策)
+
+- [ ] 13.6.A **写 LMDB UserScriptTemplate** ——
+  破解 ObjectBox 写路径(分配 ob_id、构造 FlatBuffers 表、维护
+  indexes)。可行性高(我们已会读;写就是逆向),但工程量大,
+  且永久打破"只读 LMDB"约束。
+- [ ] 13.6.B **让用户在 Reqable UI 手动建一次脚本** ——
+  Pro 授权前提下用户在 UI 创建一条 UserScriptTemplate,粘贴我们
+  ``addons.py`` 内容。我们 ``install-hook`` 改成只更新 capture_config
+  的 ``scriptConfig.scripts[]`` 引用 template id。**问题**:每次我们
+  升级 addons 模板,用户都要重新粘贴一次。
+- [ ] 13.6.C **不靠 hook 改流量,只靠规则** ——
+  放弃 onRequest/onResponse 拦截能力,把 Phase 2 缩水到只做"反向标记"
+  (tag/comment 走另一种机制)。可能可以从 LMDB 直接 update 已捕获 record
+  的 highlight / comment 字段而不动 hook —— 但同样要写 LMDB。
+
+**当前状态**:hook 已通过 ``./uninstall_hook.sh`` 完全回滚,Reqable
+配置干净。M11 (IPC + RuleEngine) 和 M12 (addons 模板 + deploy) 这两块
+代码都没浪费 —— 任何后续路径都需要它们。
 
 ### M14 — 标记类 MCP 工具(Tier 2)
 
