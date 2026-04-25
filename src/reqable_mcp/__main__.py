@@ -111,6 +111,44 @@ def cmd_install_help(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    """Install the addons hook into Reqable's capture_config."""
+    from .hook.install import apply_plan, make_plan
+
+    plan = make_plan()
+    print(plan.describe())
+    if args.dry_run:
+        print("\n(dry-run; nothing written)")
+        return 0
+    print()
+    try:
+        apply_plan(plan, force_running=args.force)
+    except RuntimeError as e:
+        print(f"refusing to install: {e}", file=sys.stderr)
+        return 2
+    print("✅ hook installed.")
+    print(f"   - hook dir: {plan.hook_dir}")
+    print(f"   - capture_config backup: {plan.backup_capture_config}")
+    print(f"   - script_environment backup: {plan.backup_script_environment}")
+    print()
+    print("Restart Reqable for it to pick up the new script.")
+    return 0
+
+
+def cmd_uninstall_hook(_: argparse.Namespace) -> int:
+    """Remove our entry from Reqable's capture_config."""
+    from .hook.install import uninstall_hook
+
+    summary = uninstall_hook()
+    print(json.dumps(summary, indent=2))
+    if summary.get("status") == "no-op":
+        return 0
+    if not summary.get("removed_script"):
+        print("note: no reqable-mcp script entry found in capture_config")
+    print("\nRestart Reqable for the change to take effect.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="reqable-mcp",
@@ -140,6 +178,28 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser(
         "install-help", help="show MCP registration JSON for Claude Code"
     ).set_defaults(func=cmd_install_help)
+
+    p_install_hook = sub.add_parser(
+        "install-hook",
+        help="install the addons hook into Reqable's capture_config (Phase 2)",
+    )
+    p_install_hook.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the plan without writing anything",
+    )
+    p_install_hook.add_argument(
+        "--force",
+        action="store_true",
+        help="install even if Reqable.app is currently running "
+        "(NOT recommended — Reqable will overwrite our changes)",
+    )
+    p_install_hook.set_defaults(func=cmd_install_hook)
+
+    sub.add_parser(
+        "uninstall-hook",
+        help="remove the addons hook from Reqable's capture_config",
+    ).set_defaults(func=cmd_uninstall_hook)
 
     args = parser.parse_args(argv)
     _setup_logging(args.log_level)
