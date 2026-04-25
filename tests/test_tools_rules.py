@@ -1118,3 +1118,99 @@ class TestStatusFilter:
                 kind="tag", side="request", host="x",
                 payload={"color": "red"}, status_min=400,
             )
+
+
+# ---------------------------------------------------------------- patch_multipart
+
+
+class TestPatchMultipart:
+    def test_text_replacement(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        out = patch_multipart(
+            part_name="username", new_text="alice",
+            host="api.example.com",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.kind == "patch_multipart"
+        assert rule.payload == {
+            "part_name": "username",
+            "new_text": "alice",
+        }
+
+    def test_file_replacement(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        f = tmp_path / "small.bin"
+        f.write_bytes(b"upload payload")
+        out = patch_multipart(
+            part_name="avatar", new_file_path=str(f),
+            host="x",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].payload["new_file_path"] == str(f)
+
+    def test_must_specify_exactly_one(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        # Both
+        out = patch_multipart(
+            part_name="x", new_text="a", new_file_path="/tmp/y", host="x",
+        )
+        assert "error" in out
+        # Neither
+        out = patch_multipart(part_name="x", host="x")
+        assert "error" in out
+
+    def test_file_must_be_absolute(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        out = patch_multipart(
+            part_name="x", new_file_path="rel/file", host="x",
+        )
+        assert "error" in out
+        assert "absolute" in out["error"]
+
+    def test_file_must_exist(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        out = patch_multipart(
+            part_name="x", new_file_path="/tmp/definitely-not-here.bin",
+            host="x",
+        )
+        assert "error" in out
+        assert "does not exist" in out["error"]
+
+    def test_file_too_big(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"x" * (BODY_MAX_BYTES + 1))
+        out = patch_multipart(
+            part_name="x", new_file_path=str(f), host="x",
+        )
+        assert "error" in out
+        assert "BODY_MAX_BYTES" in out["error"]
+
+    def test_text_too_big(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        out = patch_multipart(
+            part_name="x", new_text="a" * (BODY_MAX_BYTES + 1),
+            host="x",
+        )
+        assert "error" in out
+        assert "BODY_MAX_BYTES" in out["error"]
+
+    def test_empty_part_name_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_multipart
+
+        out = patch_multipart(part_name="", new_text="x", host="x")
+        assert "error" in out

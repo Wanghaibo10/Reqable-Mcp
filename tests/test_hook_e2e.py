@@ -888,6 +888,129 @@ def test_dry_run_replace_body_does_not_mutate(hook_setup) -> None:
     assert d.dry_run_log.stats()["total_entries"] == 1
 
 
+def test_patch_multipart_text(hook_setup) -> None:
+    """Replace one form field in a multipart/form-data request."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            "method": "POST",
+            "path": "/upload",
+            "protocol": "h2",
+            "headers": ["host: api.example.com",
+                        "content-type: multipart/form-data; boundary=B"],
+            "body": {
+                "type": 3,
+                "payload": [
+                    {
+                        "headers": [
+                            'content-disposition: form-data; name="username"',
+                            "content-length: 8",
+                        ],
+                        "body": {
+                            "type": 1,
+                            "payload": {"text": "original", "charset": "UTF-8"},
+                        },
+                    },
+                    {
+                        "headers": [
+                            'content-disposition: form-data; name="comment"',
+                            "content-length: 9",
+                        ],
+                        "body": {
+                            "type": 1,
+                            "payload": {"text": "untouched", "charset": "UTF-8"},
+                        },
+                    },
+                ],
+            },
+            "trailers": [],
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_multipart", side="request",
+        host="api.example.com",
+        payload={"part_name": "username", "new_text": "alice"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    parts = cb["request"]["body"]["payload"]
+    # Find each by Content-Disposition name.
+    by_name: dict[str, str] = {}
+    for p in parts:
+        for h in p["headers"]:
+            if 'name="username"' in h:
+                by_name["username"] = p["body"]["payload"]["text"]
+            elif 'name="comment"' in h:
+                by_name["comment"] = p["body"]["payload"]["text"]
+    assert by_name["username"] == "alice"
+    assert by_name["comment"] == "untouched"
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+
+
+def test_patch_multipart_unknown_part_no_hit(hook_setup) -> None:
+    """If the named part isn't present, the rule is a no-op."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            "method": "POST",
+            "path": "/upload",
+            "protocol": "h2",
+            "headers": ["host: api.example.com",
+                        "content-type: multipart/form-data; boundary=B"],
+            "body": {
+                "type": 3,
+                "payload": [
+                    {
+                        "headers": [
+                            'content-disposition: form-data; name="other"',
+                            "content-length: 4",
+                        ],
+                        "body": {
+                            "type": 1,
+                            "payload": {"text": "keep", "charset": "UTF-8"},
+                        },
+                    },
+                ],
+            },
+            "trailers": [],
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_multipart", side="request",
+        host="api.example.com",
+        payload={"part_name": "missing", "new_text": "x"},
+    )
+    _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 0
+
+
+def test_patch_multipart_silent_on_non_multipart(hook_setup) -> None:
+    """Non-multipart body silently no-ops."""
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="patch_multipart", side="request",
+        host="api.example.com",
+        payload={"part_name": "x", "new_text": "y"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    # Body unchanged.
+    assert cb["request"]["body"] == SAMPLE_REQUEST["request"]["body"]
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 0
+
+
 def test_status_filtered_tag_matches_4xx(hook_setup) -> None:
     """A response-side tag scoped to status 400-499 should fire on a
     404 capture but not a 200 capture."""

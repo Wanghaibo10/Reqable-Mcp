@@ -809,6 +809,102 @@ def replace_body_regex(
     return {"rule_id": rule.id, "expires_at": rule.expires_ts}
 
 
+# ---------------------------------------------------------------- patch_multipart
+# Tier 3 — replace a single ``multipart/form-data`` part by name.
+
+
+@mcp.tool()
+def patch_multipart(
+    part_name: str,
+    new_text: str | None = None,
+    new_file_path: str | None = None,
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    side: Literal["request", "response"] = "request",
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Swap one part of a multipart/form-data body in-place.
+
+    Specify exactly one of:
+
+    * ``new_text`` — replace the part with a text payload (good for
+      form fields like ``username``).
+    * ``new_file_path`` — replace the part with a local file's bytes
+      (good for ``avatar``, ``upload``, etc.). The path must be
+      absolute, exist when the rule is installed, and be ≤ 64 KB.
+
+    The part is matched by its ``Content-Disposition: name=`` value
+    — Reqable's SDK exposes that as ``part.name``. Bodies that
+    aren't multipart silently no-op.
+
+    Pair with ``host`` / ``path_pattern`` so the rewrite scope is
+    narrow. Default TTL 300s; max 3600s.
+
+    Returns ``{rule_id, expires_at}`` or ``{error}``.
+    """
+    if not isinstance(part_name, str) or not part_name:
+        return {"error": "part_name must be a non-empty string"}
+    if (new_text is None) == (new_file_path is None):
+        return {
+            "error": (
+                "specify exactly one of new_text or new_file_path"
+            )
+        }
+    if new_text is not None:
+        if not isinstance(new_text, str):
+            return {"error": "new_text must be a string"}
+        if len(new_text.encode("utf-8")) > BODY_MAX_BYTES:
+            return {
+                "error": f"new_text exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
+            }
+    payload: dict[str, Any] = {"part_name": part_name}
+    if new_text is not None:
+        payload["new_text"] = new_text
+    else:
+        from pathlib import Path
+        if not isinstance(new_file_path, str) or not new_file_path:
+            return {"error": "new_file_path must be a non-empty string"}
+        p = Path(new_file_path).expanduser()
+        if not p.is_absolute():
+            return {
+                "error": f"new_file_path must be absolute, got {new_file_path!r}"
+            }
+        if not p.exists() or not p.is_file():
+            return {"error": f"new_file_path does not exist: {p}"}
+        try:
+            size = p.stat().st_size
+        except OSError as e:
+            return {"error": f"could not stat new_file_path: {e}"}
+        if size > BODY_MAX_BYTES:
+            return {
+                "error": (
+                    f"new_file_path size {size} exceeds "
+                    f"BODY_MAX_BYTES={BODY_MAX_BYTES}"
+                )
+            }
+        payload["new_file_path"] = str(p)
+
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="patch_multipart",
+            side=side,
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload=payload,
+            ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
+
+
 # ---------------------------------------------------------------- auto_token_relay
 # Tier 3 — registers two coupled rules to ferry a token from one
 # host's response onto a later request to another host.

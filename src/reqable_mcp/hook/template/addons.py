@@ -267,6 +267,55 @@ def _patch_json_body(body, dotted_path: str, value) -> bool:
     return True
 
 
+def _patch_multipart_part(
+    body, part_name: str,
+    new_text: str | None, new_file_path: str | None,
+) -> bool:
+    """Replace a single ``multipart/form-data`` part in-place.
+
+    Returns True iff the body is multipart, a part with name
+    ``part_name`` exists, and we successfully built a replacement
+    (``HttpMultipartBody.text`` for ``new_text``, ``.file`` for
+    ``new_file_path``). Body that isn't multipart silently no-ops.
+    """
+    if not part_name:
+        return False
+    try:
+        if not getattr(body, "isMultipart", False):
+            return False
+        parts = body.payload
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(parts, list):
+        return False
+    target_index = -1
+    for i, part in enumerate(parts):
+        try:
+            if getattr(part, "name", None) == part_name:
+                target_index = i
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if target_index < 0:
+        return False
+    try:
+        if new_text is not None:
+            replacement = HttpMultipartBody.text(  # noqa: F405
+                new_text, name=part_name,
+            )
+        elif new_file_path:
+            replacement = HttpMultipartBody.file(  # noqa: F405
+                new_file_path, name=part_name,
+            )
+        else:
+            return False
+    except Exception as e:  # noqa: BLE001 - SDK can raise on bad inputs
+        _eprint(f"patch_multipart build failed: {e}")
+        return False
+    parts[target_index] = replacement
+    return True
+
+
 def _regex_replace_body(body, pattern: str, replacement: str,
                         count: int, flags: int) -> bool:
     """Run ``re.sub`` over ``body``'s text payload.
@@ -375,6 +424,7 @@ _REQUEST_KIND_ORDER: dict[str, int] = {
     "relay_inject": 0,
     "inject_header": 1,
     "patch_field": 2,        # surgical JSON patches
+    "patch_multipart": 2,    # surgical multipart-part patches
     "regex_replace": 3,      # broader text rewrites
     "replace_body": 4,       # whole-body replacement (last word)
     "tag": 9,
@@ -458,6 +508,17 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
                 msg.body, pattern, replacement,
                 int(count) if isinstance(count, int) else 0,
                 int(flags_int) if isinstance(flags_int, int) else 0,
+            )
+        elif kind == "patch_multipart":
+            part_name = rule.get("part_name")
+            new_text = rule.get("new_text")
+            new_file_path = rule.get("new_file_path")
+            if not isinstance(part_name, str) or not part_name:
+                return False
+            return _patch_multipart_part(
+                msg.body, part_name,
+                new_text if isinstance(new_text, str) else None,
+                new_file_path if isinstance(new_file_path, str) else None,
             )
         elif kind == "replace_body":
             body = rule.get("body")

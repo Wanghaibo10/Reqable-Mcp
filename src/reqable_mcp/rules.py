@@ -44,6 +44,7 @@ RuleKind = Literal[
     "relay_inject",
     "patch_field",
     "regex_replace",
+    "patch_multipart",
 ]
 RuleSide = Literal["request", "response"]
 
@@ -52,6 +53,7 @@ VALID_KINDS: frozenset[str] = frozenset(
         "tag", "comment", "inject_header", "replace_body", "mock", "block",
         "relay_extract", "relay_inject",
         "patch_field", "regex_replace",
+        "patch_multipart",
     )
 )
 VALID_SIDES: frozenset[str] = frozenset(("request", "response"))
