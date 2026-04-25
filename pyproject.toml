@@ -44,7 +44,7 @@ where = ["src"]
 include = ["reqable_mcp*"]
 
 [tool.setuptools.package-data]
-reqable_mcp = ["schema.sql"]
+reqable_mcp = ["schema.sql", "hook/template/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -54,6 +54,10 @@ addopts = "-ra -q"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Hook templates ship as deployable assets — they import reqable.py
+# (Reqable's own SDK) which only resolves at runtime in the deployed
+# directory. Skip them from lint/format.
+extend-exclude = ["src/reqable_mcp/hook/template/*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
@@ -65,3 +69,4 @@ strict = false
 warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+exclude = ["src/reqable_mcp/hook/template/.*"]
