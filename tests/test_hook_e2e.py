@@ -120,6 +120,26 @@ def _run_hook(hook_dir: Path, side: str, sample: dict, *, socket_path: Path) -> 
     return json.loads(cb_path.read_text())
 
 
+def _run_hook_raw(
+    hook_dir: Path, side: str, sample: dict, *, socket_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Like ``_run_hook`` but doesn't enforce success — used to assert
+    on ``block`` aborts where main.py is expected to exit non-zero."""
+    bin_path = hook_dir / f"{side}.bin"
+    bin_path.write_text(json.dumps(sample))
+    cb_path = hook_dir / f"{side}.bin.cb"
+    if cb_path.exists():
+        cb_path.unlink()
+
+    env = os.environ.copy()
+    env["REQABLE_MCP_SOCKET"] = str(socket_path)
+    env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.run(
+        ["python3", str(hook_dir / "main.py"), side, str(bin_path)],
+        capture_output=True, text=True, env=env, cwd=str(hook_dir), timeout=10,
+    )
+
+
 def test_no_rules_passes_through_unchanged(hook_setup) -> None:
     cb = _run_hook(
         hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
@@ -204,6 +224,104 @@ def test_host_mismatch_no_application(hook_setup) -> None:
         socket_path=hook_setup["socket"],
     )
     assert not any("X-Should-Not-Appear" in h for h in cb["request"]["headers"])
+
+
+def test_replace_body_request_string(hook_setup) -> None:
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="replace_body", side="request",
+        host="api.example.com",
+        payload={"body": "fully replaced"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    body = cb["request"]["body"]
+    assert body["type"] == 1
+    assert body["payload"]["text"] == "fully replaced"
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+
+
+def test_replace_body_response_dict(hook_setup) -> None:
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="replace_body", side="response",
+        host="api.example.com",
+        payload={"body": {"injected": True, "n": 7}},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "response", SAMPLE_RESPONSE,
+        socket_path=hook_setup["socket"],
+    )
+    # HttpBody.of() json.dumps the dict, so we get a text body back.
+    body = cb["response"]["body"]
+    assert body["type"] == 1
+    decoded = json.loads(body["payload"]["text"])
+    assert decoded == {"injected": True, "n": 7}
+
+
+def test_mock_response_status_only(hook_setup) -> None:
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="mock", side="response",
+        host="api.example.com",
+        payload={"status": 451},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "response", SAMPLE_RESPONSE,
+        socket_path=hook_setup["socket"],
+    )
+    assert cb["response"]["code"] == 451
+    # Body is unchanged because the rule didn't set one.
+    assert (
+        cb["response"]["body"]["payload"]["text"]
+        == SAMPLE_RESPONSE["response"]["body"]["payload"]["text"]
+    )
+
+
+def test_block_request_aborts_with_hit_recorded(hook_setup) -> None:
+    """Block kind raises in onRequest, so main.py exits non-zero and
+    no cb file is written — Reqable then fails the upstream session.
+    The hit must still be recorded so the user can see the rule fired.
+    """
+    d = hook_setup["daemon"]
+    rule = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        payload={},
+    )
+    res = _run_hook_raw(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    assert res.returncode != 0
+    assert "blocked by rule" in res.stderr
+    cb_path = hook_setup["hook_dir"] / "request.bin.cb"
+    assert not cb_path.exists()
+    # Most importantly: hit recorded before the abort.
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].id == rule.id
+    assert d.rule_engine.list_all()[0].hits == 1
+
+
+def test_block_request_filtered_out_does_not_fire(hook_setup) -> None:
+    """A block rule scoped to a different host should let traffic
+    through normally."""
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="block", side="request",
+        host="ads.other.com",
+        payload={},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    # Untouched
+    assert cb["request"]["headers"] == SAMPLE_REQUEST["request"]["headers"]
+    assert d.rule_engine.list_all()[0].hits == 0
 
 
 def test_addons_fail_open_when_daemon_unreachable(short_root: Path) -> None:

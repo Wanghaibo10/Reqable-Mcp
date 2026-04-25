@@ -7,15 +7,21 @@ forever — see ``rules.py`` for the engine + persistence.
 
 Rule kinds exposed here:
 
+Tier 2 (safe-ish — annotate or add to traffic, doesn't drop or replace):
 * ``tag_pattern``      → highlight matching captures (red/yellow/...)
 * ``comment_pattern``  → attach a free-form note
 * ``inject_header``    → add or override a request/response header
+
+Tier 3 (rewrites or kills traffic — read the docstrings):
+* ``replace_body``     → swap an entire request/response body
+* ``mock_response``    → fake the upstream's response (upstream still hit!)
+* ``block_request``    → abort the request before it reaches upstream
+
+Plumbing:
 * ``list_rules``       → introspect active rules
 * ``remove_rule``      → revoke one rule by id
 * ``clear_rules``      → revoke everything (panic button)
-
-Mock / block / replace_body live in a separate Tier-3 module (M15) so
-the safer surface here can ship first.
+* ``ttl_limits``       → read the TTL bounds the engine accepts
 
 Workflow note: rules persist to ``~/.reqable-mcp/rules.json``. They
 remain after the MCP server shuts down — the next start auto-loads
@@ -24,11 +30,12 @@ them (and drops anything already expired).
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Literal
 
 from ..mcp_server import get_daemon, mcp
-from ..rules import DEFAULT_TTL_SECONDS, MAX_TTL_SECONDS, Rule
+from ..rules import BODY_MAX_BYTES, DEFAULT_TTL_SECONDS, MAX_TTL_SECONDS, Rule
 
 log = logging.getLogger(__name__)
 
@@ -241,12 +248,215 @@ def clear_rules() -> dict[str, Any]:
 
 @mcp.tool()
 def ttl_limits() -> dict[str, int]:
-    """Return ``{default, max}`` TTL seconds the engine accepts.
+    """Return ``{default, max, body_max_bytes}`` the engine accepts.
 
     Lets the LLM check the bounds before installing a rule that
     would otherwise be rejected.
     """
-    return {"default": DEFAULT_TTL_SECONDS, "max": MAX_TTL_SECONDS}
+    return {
+        "default": DEFAULT_TTL_SECONDS,
+        "max": MAX_TTL_SECONDS,
+        "body_max_bytes": BODY_MAX_BYTES,
+    }
+
+
+# ---------------------------------------------------------------- replace_body
+# Tier 3 — rewrites real traffic.
+
+
+def _coerce_body(body: Any) -> tuple[Any, str | None]:
+    """Validate a body payload destined for an addons rule.
+
+    Returns ``(coerced, error)``. On success ``error`` is None.
+    The IPC channel is JSON so only ``str`` / ``dict`` survive the
+    round trip. Bytes / lists / numbers are rejected up-front so the
+    rule never makes it down to addons in a shape it can't apply.
+    """
+    if isinstance(body, str):
+        if len(body.encode("utf-8")) > BODY_MAX_BYTES:
+            return None, f"body exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
+        return body, None
+    if isinstance(body, dict):
+        try:
+            encoded = json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            return None, f"body dict not JSON-serializable: {e}"
+        if len(encoded.encode("utf-8")) > BODY_MAX_BYTES:
+            return None, f"body exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
+        return body, None
+    return None, (
+        f"body must be a str or dict; got {type(body).__name__}. "
+        "Binary bodies are not supported (IPC is JSON)."
+    )
+
+
+@mcp.tool()
+def replace_body(
+    body: str | dict[str, Any],
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    side: Literal["request", "response"] = "request",
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Swap the entire request/response body on matching live traffic.
+
+    **This rewrites real traffic.** ``side="request"`` replaces the
+    outbound body before Reqable forwards it to the upstream;
+    ``side="response"`` replaces what the requesting client receives
+    (the upstream still saw / sent the original).
+
+    ``body`` may be a ``str`` (sent as-is) or a ``dict`` (Reqable
+    json.dumps'es it server-side). Binary bodies are not supported
+    — the IPC channel is JSON. Max size: ``BODY_MAX_BYTES`` (64 KB);
+    use ``ttl_limits`` to check.
+
+    Pair with a tight ``host`` / ``path_pattern`` so this doesn't
+    catch unrelated traffic. TTL defaults to 300s; max 3600s.
+
+    Returns ``{rule_id, expires_at}`` or ``{error}``.
+    """
+    coerced, err = _coerce_body(body)
+    if err is not None:
+        return {"error": err}
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="replace_body",
+            side=side,
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload={"body": coerced},
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
+
+
+# ---------------------------------------------------------------- mock_response
+# Tier 3 — fakes the response, but does NOT prevent the upstream call.
+
+
+@mcp.tool()
+def mock_response(
+    status: int | None = None,
+    body: str | dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Fake the response the client sees — **upstream is still hit**.
+
+    Reqable's addons API does not let us short-circuit a request
+    from ``onRequest`` and synthesize a reply. The upstream server
+    is contacted and its response arrives normally; we then rewrite
+    ``status`` / ``headers`` / ``body`` before the client sees it.
+    Side-effects on the upstream (writes, rate limits, billing) are
+    NOT prevented. If you need to truly suppress the call, use
+    ``block_request`` instead.
+
+    At least one of ``status`` / ``body`` / ``headers`` must be set.
+    ``status`` is an int 100–600. ``body`` is str or dict (≤64 KB).
+    ``headers`` is a flat ``{name: value}`` dict — overwrites if the
+    name exists, otherwise appends.
+
+    Filters (``host`` / ``path_pattern`` / ``method``) and ``ttl_seconds``
+    behave the same as ``inject_header``.
+    """
+    payload: dict[str, Any] = {}
+    if status is not None:
+        if not isinstance(status, int) or not (100 <= status <= 600):
+            return {"error": f"status must be int 100-600, got {status!r}"}
+        payload["status"] = status
+    if body is not None:
+        coerced, err = _coerce_body(body)
+        if err is not None:
+            return {"error": err}
+        payload["body"] = coerced
+    if headers is not None:
+        if not isinstance(headers, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
+        ):
+            return {"error": "headers must be a dict[str, str]"}
+        if any(k.startswith(":") for k in headers):
+            return {"error": "cannot mock pseudo-headers (h2 :method/:path/etc.)"}
+        payload["headers"] = dict(headers)
+    if not payload:
+        return {"error": "must specify at least one of status / body / headers"}
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="mock",
+            side="response",
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload=payload,
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
+
+
+# ---------------------------------------------------------------- block_request
+# Tier 3 — aborts the request before it reaches upstream.
+
+
+@mcp.tool()
+def block_request(
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Abort matching requests before they reach the upstream.
+
+    The addons hook raises in ``onRequest``, which Reqable catches and
+    surfaces as a session abort — the upstream is **never contacted**.
+    The requesting client typically sees a connection error / 502.
+
+    This is the right tool when you want to truly suppress a call (vs
+    ``mock_response``, which fakes the reply but the upstream still
+    runs). Use a narrow filter — at least one of ``host`` /
+    ``path_pattern`` / ``method`` should be specified, otherwise this
+    will kill **all** outbound traffic from Reqable's MITM until TTL
+    expires. The tool refuses to install with all filters None.
+
+    TTL defaults to 300s; max 3600s.
+    """
+    if host is None and path_pattern is None and method is None:
+        return {
+            "error": (
+                "block_request requires at least one filter "
+                "(host / path_pattern / method) — refusing to block "
+                "ALL traffic. Use clear_rules() if that's truly intended."
+            )
+        }
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="block",
+            side="request",
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload={},
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
 
 
 __all__: list[str] = []  # tools register themselves via @mcp.tool

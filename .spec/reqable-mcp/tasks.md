@@ -434,17 +434,46 @@ UserScriptTemplate 行,或绕过这个机制。
 
 ### M15 — 改包类 MCP 工具(Tier 3,危险)
 
-依赖:M14、M13.3 实测结果
+依赖:M14 已完成;Reqable addons SDK(`reqable.py`,1003 行)实测过
 
-- [ ] 15.1 `src/reqable_mcp/tools/modify.py`
-  - `inject_header(host_pattern, name, value, side="request"|"response", ttl_seconds=300)`
-  - `replace_body(host_pattern, body, side, ttl_seconds=300)`
-  - `mock_response(host_pattern, status, body, headers={}, ttl_seconds=300)` — 只在 onResponse 生效;不发往源(语义需 M13.3 确认)
-  - `block_request(host_pattern, ttl_seconds=300)`
-  - **强制 TTL** — 默认 300s,最大 3600s。MCP 工具拒绝 ttl=∞
-  - 工具描述里写明"会真实修改流量,5 分钟后自动失效"
-- [ ] 15.2 `panic_button` MCP 工具:`disable_all_rules()` — 一键全停
-- [ ] 15.3 测试:`tests/test_tools_modify.py`
+**SDK 调研结论(2026-04-25)**
+
+`/Applications/Reqable.app/Contents/Frameworks/App.framework/.../assets/resources/overrides-python.zip` 只是给被脚本"代理出去的"Python 程序套代理,**不是 addons SDK**。真实 SDK 在 Reqable 运行时落到 `~/Library/Application Support/com.reqable.macosx/scripts/exec/<uuid>/{reqable.py, main.py, addons.py}`,fork-per-request 跑 `main.py request|response <file>`,读 JSON,调 addons.onRequest/onResponse,把 `result.serialize()` 写到 `<file>.cb`。返回 None 不写 cb,Reqable 原样放行。
+
+可改字段:
+- `HttpRequest`: `method / path / queries / headers / body / trailers`
+- `HttpResponse`: `code(100-600) / headers / body / trailers`
+- `Context.host` **没有 setter** → 改 host 重定向不可行
+- body 接受 `str/bytes/dict/HttpBody`(dict 自动 json.dumps,bytes 经 IPC JSON 传不过来)
+
+三个能力的真实实现路径:
+- **replace_body**:`msg.body = ...` 直接生效。binary 不支持(JSON 不能编码 bytes)
+- **mock_response**:Reqable **没有从 onRequest 短路返回响应的 API**。只能在 onResponse 改 status/headers/body。**上游请求一定会发出去,客户端看到伪造响应,但上游也被打了一次** — docstring 必须把这个约束写明
+- **block_request**:在 onRequest `raise RuntimeError`。Reqable 抓到异常会中止 session,客户端看到 connection 错误。这是唯一阻止上游被打的方式
+
+**已就位的代码**(M11/M12 阶段预埋):
+- `rules.py` 的 `Rule/RuleEngine` 已支持 `replace_body / mock / block` 三种 kind,`add()` 已强制 `mock=response` / `block=request`
+- IPC `get_rules / report_hit` 已透传 payload,**协议无需扩展**
+- `hook/template/addons.py::_apply_rule` 已实现这三种 kind 的应用逻辑(line 156-198)
+
+**M15 实际工作量**:工具层 + 几处护栏 + 测试
+
+- [ ] 15.1 在 `src/reqable_mcp/tools/rules.py` 末尾追加三个工具(同模块,与 M14 工具复用 `_engine_or_error` 等帮手):
+  - `replace_body(body, host=None, path_pattern=None, method=None, side="request"|"response", ttl_seconds=300)` — body 限 str 或 dict(JSON 自动序列化),拒绝 None/bytes/list,大小 ≤ `BODY_MAX_BYTES`
+  - `mock_response(status=None, body=None, headers=None, host=None, path_pattern=None, method=None, ttl_seconds=300)` — side 隐含 response。docstring 顶端 **「上游仍会被请求」** 警告。status 校验 100-600。headers dict[str,str]
+  - `block_request(host=None, path_pattern=None, method=None, ttl_seconds=300)` — side 隐含 request。docstring 顶端「请求被拦截,客户端看到 connection error」
+- [ ] 15.2 `rules.py` 加 `BODY_MAX_BYTES = 64 * 1024`(IPC 帧 256KB,留余量给规则数组)
+- [ ] 15.3 `addons.py` 模板 `_apply_rule` 修两处:
+  - block 命中:**先 report_hit 再 raise**,否则统计永远 0(目前 raise 会跳出 for 循环,后面 `_report_hits` 不执行)
+  - replace_body 的 `bytes` 分支删除(IPC 传不过来,误导)
+- [ ] 15.4 测试 `tests/test_tools_rules.py` 增量:
+  - 三个新工具的快乐路径 + payload 校验错误路径(body 太大、status 越界、type 错误)
+  - `mock_response` 工具默认 side=response、`block_request` 工具默认 side=request 的传参验证
+  - daemon 重启后规则持久化(已有的 `TestPersistenceBetweenDaemons` 模式扩展)
+- [ ] 15.5 `tests/test_hook_e2e.py` 加端到端单测:把 stub addons 跑起来,装 mock/replace/block 规则,断言 daemon 收到 hit、规则的 payload 字段被 addons 读出来后效果对(注:不能真起 Reqable,只能验证 addons.py + daemon socket 的握手)
+- [ ] 15.6 `panic_button` / `disable_all_rules` **不需要做** — `clear_rules` 已经是它(M14 完成)
+
+注:之前 M16 列的"规则后台 reaper / status 显示 active_rules"在 daemon 已有 `record_hit / list_all` 自动过滤过期规则,且 `status` 已经返回 `rule_engine.stats()`(by_kind / total_hits / active)。M16 大部分已落实,留一条"后台 30s reaper"作为后续优化。
 
 ### M16 — 规则管理 + 安全护栏
 

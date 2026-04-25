@@ -53,6 +53,12 @@ VALID_SIDES: frozenset[str] = frozenset(("request", "response"))
 MAX_TTL_SECONDS: int = 3600
 DEFAULT_TTL_SECONDS: int = 300
 
+# Cap for any body payload carried inside a rule (replace_body, mock).
+# IPC frame limit is 256 KB; one request may match several rules, so
+# we keep individual bodies well under that. 64 KB is plenty for the
+# JSON / HTML payloads people typically mock.
+BODY_MAX_BYTES: int = 64 * 1024
+
 
 @dataclass
 class Rule:
@@ -359,6 +365,7 @@ class RuleEngine:
 
 
 __all__ = [
+    "BODY_MAX_BYTES",
     "DEFAULT_TTL_SECONDS",
     "MAX_TTL_SECONDS",
     "Rule",

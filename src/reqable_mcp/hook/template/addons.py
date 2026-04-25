@@ -151,7 +151,8 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
                 return True
         elif kind == "replace_body":
             body = rule.get("body")
-            if isinstance(body, (str, bytes, dict)):
+            # bytes never reach here — IPC is JSON. str/dict only.
+            if isinstance(body, (str, dict)):
                 msg.body = body
                 return True
         elif kind == "mock" and side == "response":
@@ -161,18 +162,11 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
             for h, v in (rule.get("headers") or {}).items():
                 if isinstance(h, str) and isinstance(v, str):
                     msg.headers[h] = v
-            if "body" in rule:
+            if "body" in rule and isinstance(rule["body"], (str, dict)):
                 msg.body = rule["body"]
             return True
-        elif kind == "block" and side == "request":
-            # Aborting the request is signalled by raising. Reqable
-            # catches addons exceptions and surfaces them; the request
-            # never reaches the upstream server.
-            raise RuntimeError(
-                f"reqable-mcp blocked by rule {rule.get('id', '?')}"
-            )
-    except RuntimeError:
-        raise  # block — let it propagate
+        # ``block`` is handled by the caller (see onRequest) — it needs
+        # the hit reported *before* the request is aborted.
     except Exception as e:  # noqa: BLE001
         _eprint(f"rule {rule.get('id')} application failed: {e}")
         return False
@@ -182,12 +176,26 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
 def onRequest(context, request):
     rules = _fetch_rules("request", context, request)
     hits: list[str] = []
+    block_rule: dict | None = None
     for r in rules:
+        if r.get("kind") == "block":
+            # Block short-circuits subsequent rules. We still want
+            # the hit counter to reflect the abort, so record + report
+            # before raising.
+            rid = r.get("id")
+            if isinstance(rid, str):
+                hits.append(rid)
+            block_rule = r
+            break
         if _apply_rule(r, context, request, "request"):
             rid = r.get("id")
             if isinstance(rid, str):
                 hits.append(rid)
     _report_hits("request", context, hits)
+    if block_rule is not None:
+        raise RuntimeError(
+            f"reqable-mcp blocked by rule {block_rule.get('id', '?')}"
+        )
     return request
 
 

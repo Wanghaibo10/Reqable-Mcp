@@ -15,7 +15,7 @@ import pytest
 from reqable_mcp.daemon import Daemon, DaemonConfig
 from reqable_mcp.mcp_server import set_daemon
 from reqable_mcp.paths import resolve
-from reqable_mcp.rules import MAX_TTL_SECONDS
+from reqable_mcp.rules import BODY_MAX_BYTES, MAX_TTL_SECONDS
 
 
 @pytest.fixture
@@ -229,6 +229,200 @@ class TestTtlLimits:
         assert out["max"] == MAX_TTL_SECONDS
         assert out["default"] > 0
         assert out["default"] <= out["max"]
+        assert out["body_max_bytes"] == BODY_MAX_BYTES
+
+
+# ---------------------------------------------------------------- replace_body
+
+
+class TestReplaceBody:
+    def test_string_body(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body="hello world", host="api.example.com")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        rules = daemon.rule_engine.list_all()
+        assert len(rules) == 1
+        assert rules[0].kind == "replace_body"
+        assert rules[0].side == "request"
+        assert rules[0].payload == {"body": "hello world"}
+
+    def test_dict_body_preserved(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        body = {"foo": "bar", "n": 42}
+        result = replace_body(body=body, host="api.example.com")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        rules = daemon.rule_engine.list_all()
+        # We hand the dict through unchanged — addons.py's HttpBody.of()
+        # json.dumps'es it on the other side.
+        assert rules[0].payload["body"] == body
+
+    def test_response_side(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body="x", host="x", side="response")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].side == "response"
+
+    def test_bytes_body_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body=b"binary stuff", host="x")  # type: ignore[arg-type]
+        assert "error" in result
+        assert "str or dict" in result["error"]
+
+    def test_oversized_string_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        big = "a" * (BODY_MAX_BYTES + 1)
+        result = replace_body(body=big, host="x")
+        assert "error" in result
+        assert "BODY_MAX_BYTES" in result["error"]
+
+    def test_oversized_dict_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        big = {"k": "a" * BODY_MAX_BYTES}
+        result = replace_body(body=big, host="x")
+        assert "error" in result
+        assert "BODY_MAX_BYTES" in result["error"]
+
+    def test_non_serializable_dict_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body={"obj": object()}, host="x")  # type: ignore[arg-type]
+        assert "error" in result
+
+    def test_filters_normalized(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        replace_body(body="x", host="API.example.com", method="put")
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.host == "api.example.com"
+        assert rule.method == "PUT"
+
+
+# ---------------------------------------------------------------- mock_response
+
+
+class TestMockResponse:
+    def test_basic_status_only(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(status=503, host="flaky.example.com")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.kind == "mock"
+        assert rule.side == "response"  # forced by engine
+        assert rule.payload == {"status": 503}
+
+    def test_full_payload(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(
+            status=418,
+            body={"teapot": True},
+            headers={"X-Mocked": "1"},
+            host="x",
+        )
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.payload == {
+            "status": 418,
+            "body": {"teapot": True},
+            "headers": {"X-Mocked": "1"},
+        }
+
+    def test_empty_payload_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(host="x")
+        assert "error" in result
+        assert "at least one" in result["error"]
+
+    def test_status_out_of_range(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        assert "error" in mock_response(status=99, host="x")
+        assert "error" in mock_response(status=601, host="x")
+        assert "error" in mock_response(status="200", host="x")  # type: ignore[arg-type]
+
+    def test_pseudo_header_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(
+            status=200, headers={":status": "200"}, host="x"
+        )
+        assert "error" in result
+        assert "pseudo-header" in result["error"]
+
+    def test_headers_must_be_str_str(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(
+            status=200, headers={"X-Mocked": 1}, host="x"  # type: ignore[dict-item]
+        )
+        assert "error" in result
+
+    def test_oversized_body_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(body="b" * (BODY_MAX_BYTES + 1), host="x")
+        assert "error" in result
+        assert "BODY_MAX_BYTES" in result["error"]
+
+
+# ---------------------------------------------------------------- block_request
+
+
+class TestBlockRequest:
+    def test_basic_block(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(host="ads.example.com")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.kind == "block"
+        assert rule.side == "request"  # forced
+        assert rule.host == "ads.example.com"
+
+    def test_unfiltered_refused(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request()
+        assert "error" in result
+        assert "filter" in result["error"]
+        # Nothing was installed
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all() == []
+
+    def test_path_pattern_only(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(path_pattern="/track")
+        assert "rule_id" in result
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].path_pattern == "/track"
+
+    def test_method_only(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(method="DELETE")
+        assert "rule_id" in result
+
+    def test_invalid_path_regex(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(path_pattern="(unclosed")
+        assert "error" in result
 
 
 # ---------------------------------------------------------------- persistence
@@ -282,9 +476,12 @@ def test_tools_handle_missing_engine(short_data_dir: Path) -> None:
     set_daemon(fake_daemon)
 
     from reqable_mcp.tools.rules import (
+        block_request,
         clear_rules,
         inject_header,
         list_rules,
+        mock_response,
+        replace_body,
         tag_pattern,
     )
 
@@ -292,3 +489,7 @@ def test_tools_handle_missing_engine(short_data_dir: Path) -> None:
     assert "error" in inject_header(name="X", value="y")
     assert list_rules() == []
     assert "error" in clear_rules()
+    # Tier-3 tools too
+    assert "error" in replace_body(body="x", host="x")
+    assert "error" in mock_response(status=200, host="x")
+    assert "error" in block_request(host="x")
