@@ -378,6 +378,73 @@ class TestMockResponse:
         assert "error" in result
         assert "BODY_MAX_BYTES" in result["error"]
 
+    def test_empty_headers_rejected(self, daemon: Daemon) -> None:
+        """``headers={}`` would install a no-op rule that just runs
+        up hit counts. Refuse to install it."""
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(headers={}, host="x")
+        assert "error" in result
+        assert "no-op" in result["error"]
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all() == []
+
+    def test_empty_header_name_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import mock_response
+
+        result = mock_response(headers={"": "v"}, host="x")
+        assert "error" in result
+        assert "non-empty" in result["error"]
+
+
+# ---------------------------------------------------------------- _coerce_body
+# Edge cases that previously caused the tool to raise instead of
+# returning a clean error.
+
+
+class TestCoerceBodyEdgeCases:
+    def test_lone_surrogate_string_rejected_cleanly(
+        self, daemon: Daemon
+    ) -> None:
+        """``"\\ud800"`` is a lone high surrogate — not legal UTF-8.
+        ``str.encode("utf-8")`` raises UnicodeEncodeError; we want a
+        clean ``{error}`` instead of the exception bubbling out of the
+        tool."""
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body="\ud800", host="x")
+        assert "error" in result
+        assert "UTF-8" in result["error"]
+
+    def test_lone_surrogate_in_dict_rejected_cleanly(
+        self, daemon: Daemon
+    ) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        result = replace_body(body={"k": "\ud800"}, host="x")
+        assert "error" in result
+
+    def test_exact_byte_boundary(self, daemon: Daemon) -> None:
+        """A string whose UTF-8 encoding is exactly BODY_MAX_BYTES
+        must be accepted; one byte over must be rejected."""
+        from reqable_mcp.tools.rules import replace_body
+
+        ok = replace_body(body="a" * BODY_MAX_BYTES, host="x")
+        assert "rule_id" in ok
+        too_big = replace_body(body="a" * (BODY_MAX_BYTES + 1), host="x")
+        assert "error" in too_big
+
+    def test_multibyte_utf8_counted_in_bytes(
+        self, daemon: Daemon
+    ) -> None:
+        """Each '中' is 3 UTF-8 bytes; the cap is on bytes, not chars."""
+        from reqable_mcp.tools.rules import replace_body
+
+        # 22000 chars * 3 bytes = 66000 > 64KB → reject
+        result = replace_body(body="中" * 22000, host="x")
+        assert "error" in result
+        assert "BODY_MAX_BYTES" in result["error"]
+
 
 # ---------------------------------------------------------------- block_request
 
@@ -424,6 +491,36 @@ class TestBlockRequest:
         result = block_request(path_pattern="(unclosed")
         assert "error" in result
 
+    def test_empty_string_filters_treated_as_unspecified(
+        self, daemon: Daemon
+    ) -> None:
+        """``host=""`` / ``path_pattern=""`` / ``method=""`` slip past
+        ``is None`` checks but mean the same thing — the guard must
+        treat them as unspecified."""
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(host="", path_pattern="", method="")
+        assert "error" in result
+        assert "non-empty filter" in result["error"]
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all() == []
+
+    @pytest.mark.parametrize(
+        "pattern", [".*", ".+", "^", "^.*", "^.*$", ".*?"]
+    )
+    def test_catchall_path_pattern_rejected(
+        self, daemon: Daemon, pattern: str
+    ) -> None:
+        """A regex that matches every path is not a real filter — the
+        rule would silently kill all traffic."""
+        from reqable_mcp.tools.rules import block_request
+
+        result = block_request(path_pattern=pattern)
+        assert "error" in result
+        assert "every path" in result["error"]
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all() == []
+
 
 # ---------------------------------------------------------------- persistence
 
@@ -432,8 +529,13 @@ class TestPersistenceBetweenDaemons:
     def test_rules_survive_daemon_restart(
         self, real_lmdb_required: Path, short_data_dir: Path
     ) -> None:
-        """A rule installed via the MCP tool persists in rules.json
-        and is reloaded on next daemon start."""
+        """Rules of every M14 + M15 kind installed via MCP tools must
+        persist in rules.json and reload on next daemon start.
+
+        Originally this only covered ``tag_pattern``; M15 added three
+        new kinds and we want a regression test that all of them
+        round-trip through JSON, including their kind-specific payloads.
+        """
         support = real_lmdb_required.parent
         paths = resolve(reqable_support=support, our_data=short_data_dir)
 
@@ -445,8 +547,22 @@ class TestPersistenceBetweenDaemons:
         set_daemon(d1)
         from reqable_mcp.tools import rules as rules_tools
 
-        result = rules_tools.tag_pattern(host="persist.test", color="green")
-        rid = result["rule_id"]
+        installed: dict[str, str] = {}
+        installed["tag"] = rules_tools.tag_pattern(
+            host="persist.test", color="green"
+        )["rule_id"]
+        installed["replace_body"] = rules_tools.replace_body(
+            body={"persisted": True}, host="persist.test"
+        )["rule_id"]
+        installed["mock"] = rules_tools.mock_response(
+            status=503,
+            body="oops",
+            headers={"X-Persisted": "1"},
+            host="persist.test",
+        )["rule_id"]
+        installed["block"] = rules_tools.block_request(
+            host="persist.test", path_pattern="/blocked"
+        )["rule_id"]
         d1.stop()
 
         # Now bring a fresh daemon up against the same data dir.
@@ -457,8 +573,18 @@ class TestPersistenceBetweenDaemons:
         d2.start()
         try:
             assert d2.rule_engine is not None
-            ids = [r.id for r in d2.rule_engine.list_all()]
-            assert rid in ids
+            reloaded = {r.id: r for r in d2.rule_engine.list_all()}
+            for kind, rid in installed.items():
+                assert rid in reloaded, f"{kind} rule {rid} not reloaded"
+            # Spot-check kind-specific payloads survived JSON round-trip.
+            assert (
+                reloaded[installed["replace_body"]].payload["body"]
+                == {"persisted": True}
+            )
+            mock_payload = reloaded[installed["mock"]].payload
+            assert mock_payload["status"] == 503
+            assert mock_payload["headers"] == {"X-Persisted": "1"}
+            assert reloaded[installed["block"]].kind == "block"
         finally:
             d2.stop()
 

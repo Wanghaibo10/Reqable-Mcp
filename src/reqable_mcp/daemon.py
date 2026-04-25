@@ -12,6 +12,7 @@ the addons.py hook for tag/modify/mock).
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 
@@ -19,14 +20,19 @@ import lmdb
 
 from . import proxy_guard
 from .db import Database
-from .ipc.protocol import Request, error_response, ok_response
+from .ipc.protocol import MAX_MESSAGE_BYTES, Request, error_response, ok_response
 from .ipc.server import IpcServer
 from .paths import Paths, resolve
-from .rules import RuleEngine
+from .rules import Rule, RuleEngine
 from .sources.body_source import BodySource
 from .sources.lmdb_source import LmdbSource
 from .sources.objectbox_meta import Entity, load_schema
 from .wait_queue import WaitQueue
+
+# Reserve some headroom under the IPC frame cap for the wrapper JSON
+# (``{"ok":true,"data":[...]}\n``) and any commas/whitespace.
+# 4 KB is plenty for a tiny wrapper.
+_IPC_RULE_PAYLOAD_BUDGET: int = MAX_MESSAGE_BYTES - 4096
 
 log = logging.getLogger(__name__)
 
@@ -183,7 +189,8 @@ class Daemon:
                 path=args.get("path"),
                 method=args.get("method"),
             )
-            return ok_response([r.to_addon_payload() for r in rules])
+            payloads = self._pack_rules_for_ipc(rules, args)
+            return ok_response(payloads)
 
         if req.op == "report_hit":
             for rid in req.args.get("rule_ids") or []:
@@ -191,6 +198,58 @@ class Daemon:
             return ok_response({})
 
         return error_response(f"unknown op: {req.op}")
+
+    @staticmethod
+    def _pack_rules_for_ipc(
+        rules: list[Rule], req_args: dict
+    ) -> list[dict]:
+        """Pack matched rules into a payload that fits the IPC frame cap.
+
+        The naive ``[r.to_addon_payload() for r in rules]`` can exceed
+        :data:`MAX_MESSAGE_BYTES` if multiple large ``replace_body`` /
+        ``mock`` rules match the same request. When that happens
+        :func:`encode_message` raises and the addons side fails open,
+        which silently disables every other rule — including ``block``.
+
+        Strategy:
+        * always include every ``block`` rule (their payload is empty)
+        * order the rest by individual JSON size, smallest first, so a
+          single oversized rule can't crowd out many small ones
+        * stop once the running JSON size hits the budget
+
+        Drops are logged so an operator can see what got squeezed out.
+        """
+        encoded = [
+            (r, r.to_addon_payload(), len(json.dumps(r.to_addon_payload(), ensure_ascii=False)))
+            for r in rules
+        ]
+        # block-first, then ascending size.
+        encoded.sort(key=lambda t: (0 if t[0].kind == "block" else 1, t[2]))
+
+        out: list[dict] = []
+        used = 2  # the surrounding "[]"
+        dropped: list[Rule] = []
+        for rule, payload, size in encoded:
+            # +1 for the comma separator after the previous element.
+            cost = size + (1 if out else 0)
+            if used + cost > _IPC_RULE_PAYLOAD_BUDGET:
+                dropped.append(rule)
+                continue
+            out.append(payload)
+            used += cost
+        if dropped:
+            log.warning(
+                "ipc get_rules: dropped %d rule(s) to fit %d-byte budget "
+                "(matched=%d, host=%r, path=%r, side=%r); kept %d",
+                len(dropped),
+                _IPC_RULE_PAYLOAD_BUDGET,
+                len(rules),
+                req_args.get("host"),
+                req_args.get("path"),
+                req_args.get("side"),
+                len(out),
+            )
+        return out
 
     # ------------------------------------------------------------------ status
 

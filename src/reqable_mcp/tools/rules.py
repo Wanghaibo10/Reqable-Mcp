@@ -271,9 +271,18 @@ def _coerce_body(body: Any) -> tuple[Any, str | None]:
     The IPC channel is JSON so only ``str`` / ``dict`` survive the
     round trip. Bytes / lists / numbers are rejected up-front so the
     rule never makes it down to addons in a shape it can't apply.
+
+    Strings carrying lone surrogates (e.g. ``"\\ud800"``) cannot be
+    encoded to UTF-8 — we catch ``UnicodeEncodeError`` and surface a
+    clean error rather than letting an exception bubble out of a tool.
+    Same for dicts that contain such strings.
     """
     if isinstance(body, str):
-        if len(body.encode("utf-8")) > BODY_MAX_BYTES:
+        try:
+            size = len(body.encode("utf-8"))
+        except UnicodeEncodeError as e:
+            return None, f"body string not UTF-8 encodable: {e}"
+        if size > BODY_MAX_BYTES:
             return None, f"body exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
         return body, None
     if isinstance(body, dict):
@@ -281,13 +290,30 @@ def _coerce_body(body: Any) -> tuple[Any, str | None]:
             encoded = json.dumps(body, ensure_ascii=False)
         except (TypeError, ValueError) as e:
             return None, f"body dict not JSON-serializable: {e}"
-        if len(encoded.encode("utf-8")) > BODY_MAX_BYTES:
+        try:
+            size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError as e:
+            return None, f"body dict not UTF-8 encodable: {e}"
+        if size > BODY_MAX_BYTES:
             return None, f"body exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
         return body, None
     return None, (
         f"body must be a str or dict; got {type(body).__name__}. "
         "Binary bodies are not supported (IPC is JSON)."
     )
+
+
+# Patterns that are *technically* regexes but match every path. Allowing
+# any of these inside a ``block_request`` filter would let the rule
+# silently kill all traffic — same outcome as no filter at all.
+_CATCHALL_PATTERNS: frozenset[str] = frozenset(
+    ("", ".*", ".+", ".*?", ".+?", "^", "^.*", "^.+", "^.*$", "^.+$")
+)
+
+
+def _is_specified(value: str | None) -> bool:
+    """``None`` and empty-string both mean "no filter"."""
+    return value is not None and value != ""
 
 
 @mcp.tool()
@@ -384,6 +410,15 @@ def mock_response(
             isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
         ):
             return {"error": "headers must be a dict[str, str]"}
+        if not headers:
+            return {
+                "error": (
+                    "headers={} would install a no-op rule; pass at least "
+                    "one header or omit the argument"
+                )
+            }
+        if any(not k for k in headers):
+            return {"error": "header names must be non-empty"}
         if any(k.startswith(":") for k in headers):
             return {"error": "cannot mock pseudo-headers (h2 :method/:path/etc.)"}
         payload["headers"] = dict(headers)
@@ -433,12 +468,26 @@ def block_request(
 
     TTL defaults to 300s; max 3600s.
     """
-    if host is None and path_pattern is None and method is None:
+    # An empty string slips past ``is None`` but means the same thing:
+    # "match anything." Treat both as unspecified.
+    if not (
+        _is_specified(host)
+        or _is_specified(path_pattern)
+        or _is_specified(method)
+    ):
         return {
             "error": (
-                "block_request requires at least one filter "
+                "block_request requires at least one non-empty filter "
                 "(host / path_pattern / method) — refusing to block "
                 "ALL traffic. Use clear_rules() if that's truly intended."
+            )
+        }
+    if path_pattern is not None and path_pattern in _CATCHALL_PATTERNS:
+        return {
+            "error": (
+                f"path_pattern={path_pattern!r} matches every path — "
+                "use a narrower regex, or rely on host/method filters "
+                "to scope the block."
             )
         }
     engine = _engine_or_error()

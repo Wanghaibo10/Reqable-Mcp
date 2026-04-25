@@ -143,6 +143,86 @@ def test_unknown_op_returns_error(started_daemon: Daemon) -> None:
     assert "unknown op" in resp["error"]
 
 
+def test_pack_rules_drops_oversize_to_fit_frame(short_data_dir: Path) -> None:
+    """A single ``replace_body`` rule large enough that *several* of
+    them would exceed ``MAX_MESSAGE_BYTES`` must not crowd out the
+    rest. The packer trims down to a frame the IPC server can encode.
+    """
+    from reqable_mcp.daemon import Daemon as DaemonCls
+    from reqable_mcp.ipc.protocol import MAX_MESSAGE_BYTES, encode_message
+    from reqable_mcp.rules import BODY_MAX_BYTES, RuleEngine
+
+    engine = RuleEngine(short_data_dir / "rules.json", autoload=False)
+    # Six rules at ~64 KB each = ~384 KB total, well past 256 KB cap.
+    rules = []
+    for i in range(6):
+        rules.append(
+            engine.add(
+                kind="replace_body", side="response",
+                host=f"h{i}.example.com",
+                payload={"body": "x" * (BODY_MAX_BYTES - 10)},
+            )
+        )
+    # match_for would normally filter — for this test we just hand the
+    # full list to the packer.
+    packed = DaemonCls._pack_rules_for_ipc(rules, {"host": "test"})
+    # At least one was dropped (six * 64KB > budget).
+    assert len(packed) < len(rules)
+    # And the resulting payload encodes successfully under the cap.
+    encoded = encode_message({"ok": True, "data": packed})
+    assert len(encoded) <= MAX_MESSAGE_BYTES
+
+
+def test_pack_rules_always_keeps_block(short_data_dir: Path) -> None:
+    """A ``block`` rule must survive packing even when the rule list
+    contains many large ``replace_body`` rules ahead of it. Otherwise
+    the addons-side fail-open path would silently let blocked traffic
+    through."""
+    from reqable_mcp.daemon import Daemon as DaemonCls
+    from reqable_mcp.rules import BODY_MAX_BYTES, RuleEngine
+
+    engine = RuleEngine(short_data_dir / "rules.json", autoload=False)
+    big_rules = [
+        engine.add(
+            kind="replace_body", side="response",
+            host=f"h{i}.example.com",
+            payload={"body": "x" * (BODY_MAX_BYTES - 10)},
+        )
+        for i in range(8)
+    ]
+    block = engine.add(
+        kind="block", side="request",
+        host="evil.example.com",
+        payload={},
+    )
+    packed = DaemonCls._pack_rules_for_ipc(big_rules + [block], {})
+    kinds = [p["kind"] for p in packed]
+    assert "block" in kinds, (
+        f"block rule got dropped during packing; kinds={kinds}"
+    )
+
+
+def test_pack_rules_passthrough_under_budget(short_data_dir: Path) -> None:
+    """Small rule sets pass through the packer unchanged."""
+    from reqable_mcp.daemon import Daemon as DaemonCls
+    from reqable_mcp.rules import RuleEngine
+
+    engine = RuleEngine(short_data_dir / "rules.json", autoload=False)
+    r1 = engine.add(
+        kind="inject_header", side="request",
+        host="a.example.com",
+        payload={"name": "X-A", "value": "1"},
+    )
+    r2 = engine.add(
+        kind="tag", side="request",
+        host="a.example.com",
+        payload={"color": "red"},
+    )
+    packed = DaemonCls._pack_rules_for_ipc([r1, r2], {})
+    assert len(packed) == 2
+    assert {p["id"] for p in packed} == {r1.id, r2.id}
+
+
 def test_status_reports_ipc_and_rules(started_daemon: Daemon) -> None:
     assert started_daemon.rule_engine is not None
     started_daemon.rule_engine.add(

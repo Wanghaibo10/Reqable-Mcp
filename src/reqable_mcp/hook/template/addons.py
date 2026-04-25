@@ -175,27 +175,27 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
 
 def onRequest(context, request):
     rules = _fetch_rules("request", context, request)
+    # Two-pass: any block rule wins outright. We do NOT apply
+    # inject_header / replace_body / etc. on a request that's about
+    # to be aborted — those edits would never reach upstream and
+    # would just inflate hit counts of rules that had no effect.
+    block_rules = [r for r in rules if r.get("kind") == "block"]
+    if block_rules:
+        block_hits = [
+            r["id"] for r in block_rules if isinstance(r.get("id"), str)
+        ]
+        _report_hits("request", context, block_hits)
+        raise RuntimeError(
+            f"reqable-mcp blocked by rule "
+            f"{block_rules[0].get('id', '?')}"
+        )
     hits: list[str] = []
-    block_rule: dict | None = None
     for r in rules:
-        if r.get("kind") == "block":
-            # Block short-circuits subsequent rules. We still want
-            # the hit counter to reflect the abort, so record + report
-            # before raising.
-            rid = r.get("id")
-            if isinstance(rid, str):
-                hits.append(rid)
-            block_rule = r
-            break
         if _apply_rule(r, context, request, "request"):
             rid = r.get("id")
             if isinstance(rid, str):
                 hits.append(rid)
     _report_hits("request", context, hits)
-    if block_rule is not None:
-        raise RuntimeError(
-            f"reqable-mcp blocked by rule {block_rule.get('id', '?')}"
-        )
     return request
 
 

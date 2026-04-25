@@ -324,6 +324,63 @@ def test_block_request_filtered_out_does_not_fire(hook_setup) -> None:
     assert d.rule_engine.list_all()[0].hits == 0
 
 
+def test_block_short_circuits_other_request_rules(hook_setup) -> None:
+    """When ``block`` and ``inject_header`` both match the same request,
+    the addons template must abort without applying inject — its hit
+    counter would otherwise inflate while the request goes nowhere.
+    """
+    d = hook_setup["daemon"]
+    inject = d.rule_engine.add(
+        kind="inject_header", side="request",
+        host="api.example.com",
+        payload={"name": "X-Should-Not-Apply", "value": "racy"},
+    )
+    block = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        payload={},
+    )
+    res = _run_hook_raw(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    assert res.returncode != 0
+    assert "blocked by rule" in res.stderr
+    cb_path = hook_setup["hook_dir"] / "request.bin.cb"
+    assert not cb_path.exists()
+    time.sleep(0.05)
+    rules_now = {r.id: r for r in d.rule_engine.list_all()}
+    # Only the block was credited with a hit.
+    assert rules_now[block.id].hits == 1
+    assert rules_now[inject.id].hits == 0
+
+
+def test_multiple_block_rules_all_record_hits(hook_setup) -> None:
+    """If two block rules match the same request, both should be
+    credited so the operator can see which scopes actually fired."""
+    d = hook_setup["daemon"]
+    b1 = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        payload={},
+    )
+    b2 = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        path_pattern="/v1/login",
+        payload={},
+    )
+    res = _run_hook_raw(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    assert res.returncode != 0
+    time.sleep(0.05)
+    by_id = {r.id: r for r in d.rule_engine.list_all()}
+    assert by_id[b1.id].hits == 1
+    assert by_id[b2.id].hits == 1
+
+
 def test_addons_fail_open_when_daemon_unreachable(short_root: Path) -> None:
     """If the socket doesn't exist, addons must pass the request
     through unchanged — we never break user traffic."""
