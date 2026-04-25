@@ -365,6 +365,79 @@ def test_timeout_out_of_range(mock_daemon) -> None:
     assert "timeout_seconds" in out["error"]
 
 
+def test_content_length_override_dropped(
+    mock_daemon, http_server: tuple[str, type[_Recorder]]
+) -> None:
+    """A caller-supplied Content-Length must NOT be honored — urllib
+    re-computes it from the actual body bytes; honoring an override
+    would just create a body/declared-length mismatch."""
+    base, rec = http_server
+    replay_request(
+        uid="fake-uid", url=f"{base}/x",
+        body="hello",
+        headers={"Content-Length": "999"},  # garbage override
+    )
+    # http.server reads Content-Length bytes; if the override leaked
+    # through, Content-Length=999 with a 5-byte body would have hung
+    # the test (rfile.read(999) blocks waiting for more bytes).
+    assert rec.captured["body"] == b"hello"
+    assert rec.captured["headers"]["content-length"] == "5"
+
+
+def test_ipv6_host_bracketed(mock_daemon) -> None:
+    """When we synthesize a URL from a captured IPv6 connection, the
+    literal must be bracketed or urllib will choke on it."""
+    # Force url-synthesis path by clearing the captured url.
+    mock_daemon.db.get_capture.return_value = {
+        "uid": "fake-uid", "ob_id": 1,
+        "url": "",  # forces synthesis
+        "host": "::1", "path": "/", "method": "GET",
+    }
+    mock_daemon.lmdb_source.fetch_record.return_value = {
+        "session": {
+            "id": 1,
+            "request": {
+                "requestLine": {"method": "GET", "path": "/"},
+                "headers": [],
+            },
+            "connection": {
+                "originHost": "::1", "security": False,
+                "timestamp": 1, "id": 1,
+            },
+        }
+    }
+    out = replay_request(uid="fake-uid", timeout_seconds=0.5)
+    # The synthesized URL must round-trip through urlparse without
+    # complaint. We can't easily assert the URL string from the
+    # outside, but a "could not determine host" or "invalid replay
+    # URL" error would mean we never bracketed it. Real connection
+    # fails (no listener on ::1:80), but that's an OSError network
+    # error — the URL itself was acceptable.
+    assert "error" in out
+    assert "invalid replay URL" not in out["error"]
+    assert "could not determine host" not in out["error"]
+
+
+def test_synthesis_with_no_host_rejected(mock_daemon) -> None:
+    mock_daemon.db.get_capture.return_value = {
+        "uid": "fake-uid", "ob_id": 1, "url": "", "host": "",
+        "path": "/", "method": "GET",
+    }
+    mock_daemon.lmdb_source.fetch_record.return_value = {
+        "session": {
+            "id": 1,
+            "request": {
+                "requestLine": {"method": "GET", "path": "/"},
+                "headers": [],
+            },
+            "connection": {"originHost": "", "security": False, "timestamp": 1, "id": 1},
+        }
+    }
+    out = replay_request(uid="fake-uid")
+    assert "error" in out
+    assert "host" in out["error"]
+
+
 def test_4xx_response_returned_not_raised(
     mock_daemon, http_server: tuple[str, type[_Recorder]],
 ) -> None:

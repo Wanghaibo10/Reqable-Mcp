@@ -33,6 +33,13 @@ DEFAULT_RELAY_TTL_SECONDS: int = 300
 # almost always a bug or an attempt to misuse this for body relay.
 MAX_RELAY_VALUE_BYTES: int = 8 * 1024
 
+# Hard cap on the number of distinct relay names. Without this an LLM
+# could install a relay rule whose ``source_field`` varies per request
+# (e.g. extracting a fresh request id), filling the store until the
+# 30s reaper sweeps. 256 is far above any realistic auth-relay count
+# but well below "noticeable memory pressure".
+MAX_RELAY_ENTRIES: int = 256
+
 
 @dataclass
 class RelayEntry:
@@ -62,6 +69,16 @@ class RelayStore:
                 f"ttl_seconds must be in (0, {MAX_RELAY_TTL_SECONDS}]"
             )
         with self._lock:
+            # Allow refreshing an existing entry but reject net-new
+            # entries once we hit the cardinality cap. This limits
+            # blast-radius of a misconfigured relay rule that varies
+            # ``source_field`` per request.
+            if name not in self._values and len(self._values) >= MAX_RELAY_ENTRIES:
+                raise ValueError(
+                    f"relay store full ({MAX_RELAY_ENTRIES} entries); "
+                    "wait for TTL or call clear_rules to remove the "
+                    "rule that's churning new names"
+                )
             self._values[name] = RelayEntry(value, time.time() + ttl_seconds)
 
     def get(self, name: str) -> str | None:
@@ -115,6 +132,7 @@ class RelayStore:
 
 __all__ = [
     "DEFAULT_RELAY_TTL_SECONDS",
+    "MAX_RELAY_ENTRIES",
     "MAX_RELAY_TTL_SECONDS",
     "MAX_RELAY_VALUE_BYTES",
     "RelayEntry",

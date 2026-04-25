@@ -88,6 +88,11 @@ def _merge_headers(
             if not isinstance(k, str) or not k:
                 continue
             key = k.lower()
+            # Content-Length is computed by urllib from the actual
+            # body bytes. Letting a caller set it would just create
+            # a body / declared-length mismatch — silently drop it.
+            if key == "content-length":
+                continue
             if v == "":
                 captured.pop(key, None)
             else:
@@ -227,6 +232,12 @@ def replay_request(
         conn = sess.get("connection") or {}
         scheme = "https" if conn.get("security") else "http"
         host = conn.get("originHost") or row.get("host") or ""
+        if not host:
+            return {"error": "could not determine host for replay"}
+        # IPv6 literals must be bracketed in URLs (RFC 3986 §3.2.2).
+        # We detect by colon presence: hostnames don't contain ':'.
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         path = rl.get("path") or row.get("path") or "/"
         actual_url = f"{scheme}://{host}{path}"
     parsed = urlparse(actual_url)

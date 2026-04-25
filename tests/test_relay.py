@@ -115,3 +115,19 @@ def test_ttl_zero_or_negative_rejected() -> None:
         s.set("k", "v", ttl_seconds=0)
     with pytest.raises(ValueError):
         s.set("k", "v", ttl_seconds=-1)
+
+
+def test_cardinality_cap_rejects_new_names() -> None:
+    """Once we hit MAX_RELAY_ENTRIES, distinct new names are refused
+    but existing names can still be refreshed."""
+    from reqable_mcp.relay import MAX_RELAY_ENTRIES
+
+    s = RelayStore()
+    for i in range(MAX_RELAY_ENTRIES):
+        s.set(f"k{i}", "v", ttl_seconds=60)
+    # Net-new name → reject.
+    with pytest.raises(ValueError, match="store full"):
+        s.set("overflow", "v", ttl_seconds=60)
+    # Refreshing an existing name → still works.
+    s.set("k0", "v2", ttl_seconds=60)
+    assert s.get("k0") == "v2"

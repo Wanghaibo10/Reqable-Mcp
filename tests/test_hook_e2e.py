@@ -471,6 +471,96 @@ def test_relay_inject_no_value_yet_does_nothing(hook_setup) -> None:
     assert d.rule_engine.list_all()[0].hits == 0
 
 
+def test_relay_extract_does_not_mutate_response_body(hook_setup) -> None:
+    """Critical: ``relay_extract`` must read the body without
+    mutating it. Earlier versions called ``body.jsonify()`` which
+    permanently changed the payload — Reqable would then re-serialize
+    a different byte sequence to the client (whitespace, key order,
+    Content-Length).
+    """
+    d = hook_setup["daemon"]
+    original_text = '{"data":{"access_token":"the-token"},"junk":1}'
+    sample = {
+        "context": {
+            **SAMPLE_RESPONSE["context"],  # type: ignore[arg-type]
+            "host": "login.example.com",
+        },
+        "response": {
+            "request": {**SAMPLE_REQUEST["request"]},  # type: ignore[arg-type]
+            "code": 200, "message": "OK", "protocol": "h2",
+            "headers": ["content-type: application/json"],
+            "body": {"type": 1, "payload": {"text": original_text, "charset": "UTF-8"}},
+            "trailers": [],
+        },
+    }
+    d.rule_engine.add(
+        kind="relay_extract", side="response",
+        host="login.example.com",
+        payload={
+            "name": "tok",
+            "source_loc": "json_body",
+            "source_field": "data.access_token",
+            "ttl_seconds": 60,
+        },
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "response", sample,
+        socket_path=hook_setup["socket"],
+    )
+    # Token was extracted.
+    time.sleep(0.05)
+    assert d.relay_store.get("tok") == "the-token"
+    # And the response body is unchanged byte-for-byte.
+    assert cb["response"]["body"]["type"] == 1
+    assert cb["response"]["body"]["payload"]["text"] == original_text
+
+
+def test_relay_extract_runs_before_replace_body(hook_setup) -> None:
+    """Apply order: ``relay_extract`` must see the original body even
+    when a ``replace_body`` rule on the same response exists. Without
+    a deterministic order the daemon's pack-by-size sort could put
+    replace_body first, masking the token from extract."""
+    d = hook_setup["daemon"]
+    original = '{"data":{"access_token":"original"}}'
+    sample = {
+        "context": {
+            **SAMPLE_RESPONSE["context"],  # type: ignore[arg-type]
+            "host": "login.example.com",
+        },
+        "response": {
+            "request": {**SAMPLE_REQUEST["request"]},  # type: ignore[arg-type]
+            "code": 200, "message": "OK", "protocol": "h2",
+            "headers": ["content-type: application/json"],
+            "body": {"type": 1, "payload": {"text": original, "charset": "UTF-8"}},
+            "trailers": [],
+        },
+    }
+    # Two rules on the same response. addons must run extract first.
+    d.rule_engine.add(
+        kind="replace_body", side="response",
+        host="login.example.com",
+        payload={"body": {"replaced": True}},
+    )
+    d.rule_engine.add(
+        kind="relay_extract", side="response",
+        host="login.example.com",
+        payload={
+            "name": "tok",
+            "source_loc": "json_body",
+            "source_field": "data.access_token",
+            "ttl_seconds": 60,
+        },
+    )
+    _run_hook(
+        hook_setup["hook_dir"], "response", sample,
+        socket_path=hook_setup["socket"],
+    )
+    time.sleep(0.05)
+    # The original token is what got stored — proving extract ran
+    # before replace_body clobbered the payload.
+    assert d.relay_store.get("tok") == "original"
+
+
 def test_relay_extract_from_response_header(hook_setup) -> None:
     """source_loc='header' pulls a token from a response header
     (e.g. ``Set-Cookie`` or ``X-Token``)."""

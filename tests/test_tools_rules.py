@@ -691,13 +691,10 @@ class TestAutoTokenRelay:
         )
         assert "error" in out
 
-    def test_inject_rule_rejection_rolls_back_extract(
-        self, daemon: Daemon, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If the second engine.add() rejects (e.g. corrupt regex on
-        target_path_pattern), the extract rule we just installed must
-        NOT linger — otherwise we'd silently store tokens nobody
-        injects."""
+    def test_invalid_regex_caught_pre_engine(self, daemon: Daemon) -> None:
+        """Invalid path_pattern regexes must be caught BEFORE we touch
+        engine.add — otherwise a daemon crash between the persisted
+        extract and the to-be-rejected inject would leave an orphan."""
         from reqable_mcp.tools.rules import auto_token_relay
 
         out = auto_token_relay(
@@ -706,8 +703,37 @@ class TestAutoTokenRelay:
             target_path_pattern="(unclosed",  # invalid regex
         )
         assert "error" in out
+        assert "target_path_pattern" in out["error"]
         assert daemon.rule_engine is not None
-        # No half-installed extract rule.
+        # Critical: NO rule was persisted, including the extract side.
+        assert daemon.rule_engine.list_all() == []
+
+    def test_invalid_source_regex_caught_pre_engine(
+        self, daemon: Daemon
+    ) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X",
+            target_host="b", target_header="Y",
+            source_path_pattern="(unclosed",
+        )
+        assert "error" in out
+        assert "source_path_pattern" in out["error"]
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all() == []
+
+    def test_ttl_out_of_range(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X",
+            target_host="b", target_header="Y",
+            ttl_seconds=999_999,
+        )
+        assert "error" in out
+        assert "ttl_seconds" in out["error"]
+        assert daemon.rule_engine is not None
         assert daemon.rule_engine.list_all() == []
 
     def test_invalid_path_pattern(self, daemon: Daemon) -> None:

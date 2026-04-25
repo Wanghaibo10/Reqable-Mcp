@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Literal
 
 from ..mcp_server import get_daemon, mcp
@@ -584,6 +585,29 @@ def auto_token_relay(
         else f"{source_host.lower()}:{source_field}"
     )
 
+    # Pre-validate everything ``engine.add`` could fail on. Rolling
+    # back via ``remove`` after the second ``add`` rejects works for
+    # in-process failures, but a daemon crash *between* "extract was
+    # persisted" and "inject was rejected → remove called" would
+    # leave an orphaned extract rule that silently stores tokens for
+    # nobody. Catching the regex compile up here closes that window.
+    for label, pat in (
+        ("source_path_pattern", source_path_pattern),
+        ("target_path_pattern", target_path_pattern),
+    ):
+        if pat is not None:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                return {"error": f"invalid {label}: {e}"}
+    if not isinstance(ttl_seconds, int) or ttl_seconds <= 0 or ttl_seconds > MAX_TTL_SECONDS:
+        return {
+            "error": (
+                f"ttl_seconds must be int in (0, {MAX_TTL_SECONDS}], "
+                f"got {ttl_seconds!r}"
+            )
+        }
+
     engine = _engine_or_error()
     if engine is None:
         return {"error": "rule engine not available — daemon not fully started"}
@@ -617,8 +641,9 @@ def auto_token_relay(
             ttl_seconds=ttl_seconds,
         )
     except ValueError as e:
-        # Roll back the extract side so we don't leave a half-installed
-        # relay quietly storing tokens nobody injects.
+        # Last-resort rollback. Pre-validation should have caught
+        # everything that can fail here in practice; this branch is
+        # for genuinely unexpected failures.
         engine.remove(extract_rule.id)
         return {"error": f"inject rule rejected: {e}"}
 

@@ -24,6 +24,7 @@ import gzip
 import html
 import json
 import logging
+import os
 import re  # used by _pretty_html
 import zlib
 from pathlib import Path
@@ -121,8 +122,12 @@ def _walk_content_encoding(
     Returns ``(decoded_bytes, applied_chain, error_or_None)``. The
     chain is the list of codecs we *successfully* applied; if a codec
     fails we stop and return the partial result + an error.
+
+    An empty body short-circuits even if a stale ``Content-Encoding``
+    header is set: a 204/HEAD-style response often carries one and
+    we'd rather report "no work to do" than "decompress failed".
     """
-    if not content_encoding:
+    if not content_encoding or not raw:
         return raw, [], None
     # Multiple codings comma-separated, applied last → first.
     codecs = [c.strip() for c in content_encoding.split(",") if c.strip()]
@@ -432,9 +437,22 @@ def dump_body(
         }
 
     assert target is not None  # _validate_dump_path returned no error
-    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Open the *raw* (un-resolved) path so ``O_NOFOLLOW`` actually has
+    # a symlink to refuse. ``target`` from _validate_dump_path went
+    # through ``resolve(strict=False)`` which already followed any
+    # symlink in the input — using it for the write would defeat the
+    # TOCTOU defense. The Reqable-dir refusal already used the
+    # resolved form.
+    raw_target = Path(path).expanduser()
+    raw_target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
     try:
-        with target.open("wb") as f:
+        fd = os.open(str(raw_target), flags, 0o600)
+    except OSError as e:
+        return {"error": f"open refused (symlink? {e})"}
+    try:
+        with os.fdopen(fd, "wb") as f:
             f.write(body)
     except OSError as e:
         return {"error": f"write failed: {e}"}
@@ -531,6 +549,12 @@ def _capture_to_har_entry(uid: str) -> dict[str, Any] | None:
         conn = sess.get("connection") or {}
         scheme = "https" if conn.get("security") else "http"
         host = conn.get("originHost") or row.get("host") or ""
+        if not host:
+            # Without a host we'd emit an invalid URL Chrome HAR
+            # import would reject. Skip this entry.
+            return None
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"  # IPv6 literal must be bracketed
         path = rl.get("path") or row.get("path") or "/"
         url = f"{scheme}://{host}{path}"
 
@@ -712,11 +736,19 @@ def export_har(
         }
     }
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # Same O_NOFOLLOW defense as ``dump_body``. Use the raw path
+    # because the resolved form has already followed symlinks.
+    raw_target = Path(path).expanduser()
+    raw_target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
     try:
-        with target.open("w", encoding="utf-8") as f:
+        fd = os.open(str(raw_target), flags, 0o600)
+    except OSError as e:
+        return {"error": f"open refused (symlink? {e})"}
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(har, f, ensure_ascii=False, indent=2)
-        size = target.stat().st_size
+        size = raw_target.stat().st_size
     except OSError as e:
         return {"error": f"write failed: {e}"}
 

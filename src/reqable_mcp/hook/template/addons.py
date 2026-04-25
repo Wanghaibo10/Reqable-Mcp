@@ -116,12 +116,19 @@ def _report_hits(side: str, context, hits: list[str]) -> None:
     )
 
 
-def _store_relay(name: str, value: str, ttl_seconds: int) -> None:
-    """Send an extracted token to the daemon's RelayStore."""
-    _ipc_call(
+def _store_relay(name: str, value: str, ttl_seconds: int) -> bool:
+    """Send an extracted token to the daemon's RelayStore.
+
+    Returns True iff the daemon confirmed the store. Callers use this
+    to decide whether to record a hit — a rejected store (oversized
+    value, daemon-side validation error) shouldn't count as the rule
+    "applying."
+    """
+    resp = _ipc_call(
         "store_relay_value",
         {"name": name, "value": value, "ttl_seconds": ttl_seconds},
     )
+    return bool(resp and resp.get("ok"))
 
 
 def _get_relay(name: str) -> str | None:
@@ -148,20 +155,35 @@ def _extract_from_header(headers, field: str) -> str | None:
 def _extract_from_json_body(body, dotted_path: str) -> str | None:
     """Walk a dotted path through a JSON body. Returns str or None.
 
-    ``msg.body`` is a Reqable HttpBody. We jsonify() to get a dict if
-    the body is text, then index. Lists are supported via integer
-    components: ``data.items.0.token``.
+    Lists are addressable via integer components: ``data.items.0.token``.
+
+    **Important:** we deliberately do NOT call ``body.jsonify()``.
+    That mutator would replace the body's text payload with a parsed
+    dict, and Reqable would re-serialize it before sending — quietly
+    rewriting the bytes the client receives (whitespace, key order,
+    Content-Length mismatch). We parse a private copy instead and
+    leave the original untouched.
     """
     if not dotted_path:
         return None
     try:
-        body.jsonify()  # noqa: F811 — Reqable HttpBody
-    except Exception:  # noqa: BLE001
+        if not getattr(body, "isText", False):
+            return None
+        raw = body.payload
+    except Exception:  # noqa: BLE001 - Reqable HttpBody can raise on weird state
         return None
-    payload = body.payload
-    if not isinstance(payload, (dict, list)):
+    if isinstance(raw, dict):
+        # Some earlier rule may have already jsonify'd this body; tolerate.
+        cursor: object = raw
+    elif isinstance(raw, str):
+        try:
+            cursor = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    else:
         return None
-    cursor = payload
+    if not isinstance(cursor, (dict, list)):
+        return None
     for part in dotted_path.split("."):
         if isinstance(cursor, dict):
             cursor = cursor.get(part)
@@ -187,6 +209,42 @@ _HIGHLIGHTS = {
     "none": 0, "red": 1, "yellow": 2, "green": 3,
     "blue": 4, "teal": 5, "strikethrough": 6,
 }
+
+# Deterministic apply order. The daemon may pack rules in any order
+# (block-first, then by IPC payload size to fit the frame cap), but
+# the addons side needs a stable, semantically-sensible order or
+# rules silently shadow each other. Lower number wins.
+#
+# Request side: relay_inject sets a header *before* a manual
+# inject_header could overwrite it; a replace_body rule overwrites
+# the inject body last; tag/comment touch only ``context`` so they
+# come last.
+_REQUEST_KIND_ORDER: dict[str, int] = {
+    "relay_inject": 0,
+    "inject_header": 1,
+    "replace_body": 2,
+    "tag": 9,
+    "comment": 9,
+}
+
+# Response side: relay_extract MUST run before any rule that mutates
+# the body, otherwise we'd extract from a doctored payload.
+_RESPONSE_KIND_ORDER: dict[str, int] = {
+    "relay_extract": 0,
+    "inject_header": 1,
+    "replace_body": 2,
+    "mock": 3,
+    "tag": 9,
+    "comment": 9,
+}
+
+
+def _sort_key_request(rule: dict) -> int:
+    return _REQUEST_KIND_ORDER.get(rule.get("kind"), 9)
+
+
+def _sort_key_response(rule: dict) -> int:
+    return _RESPONSE_KIND_ORDER.get(rule.get("kind"), 9)
 
 
 def _apply_rule(rule: dict, context, msg, side: str) -> bool:
@@ -244,11 +302,14 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
                 extracted = _extract_from_json_body(msg.body, source_field)
             if extracted is None:
                 return False
-            _store_relay(
+            stored = _store_relay(
                 relay_name, extracted,
                 int(ttl) if isinstance(ttl, int) else 300,
             )
-            return True
+            # If the daemon rejected the store (oversized value,
+            # cardinality cap, etc.) don't count this as a hit — the
+            # relay didn't actually take effect.
+            return stored
         elif kind == "relay_inject" and side == "request":
             relay_name = rule.get("name")
             target_header = rule.get("target_header")
@@ -286,6 +347,11 @@ def onRequest(context, request):
             f"reqable-mcp blocked by rule "
             f"{block_rules[0].get('id', '?')}"
         )
+    # Stable, semantically-meaningful apply order — see the comment
+    # on ``_REQUEST_KIND_ORDER``. Sorted is stable, so equal-priority
+    # rules retain the order the daemon sent them (block-first,
+    # ascending size).
+    rules.sort(key=_sort_key_request)
     hits: list[str] = []
     for r in rules:
         if _apply_rule(r, context, request, "request"):
@@ -298,6 +364,7 @@ def onRequest(context, request):
 
 def onResponse(context, response):
     rules = _fetch_rules("response", context, response)
+    rules.sort(key=_sort_key_response)
     hits: list[str] = []
     for r in rules:
         if _apply_rule(r, context, response, "response"):

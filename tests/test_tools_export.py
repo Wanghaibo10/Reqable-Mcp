@@ -128,6 +128,14 @@ class TestWalkContentEncoding:
         # Nothing was successfully applied.
         assert chain == []
 
+    def test_empty_body_short_circuits(self) -> None:
+        """A 204/HEAD-style empty body with a stale Content-Encoding
+        header should short-circuit, not surface a decode error."""
+        out, chain, err = _walk_content_encoding(b"", "gzip")
+        assert out == b""
+        assert chain == []
+        assert err is None
+
 
 class TestHeaderHelpers:
     def test_content_encoding(self) -> None:
@@ -415,6 +423,23 @@ class TestDumpBodyTool:
         out = dump_body("fake-uid", "response", str(target))
         assert target.read_bytes() == b"hi"
         assert "error" not in out
+
+    def test_refuses_to_overwrite_symlink(self, tmp_path: Path) -> None:
+        """O_NOFOLLOW must reject a symlink at the target path —
+        defends against TOCTOU where a symlink is dropped between
+        path validation and write."""
+        import os as _os
+
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"original")
+        link = tmp_path / "out.bin"
+        _os.symlink(decoy, link)
+        set_daemon(_make_mock_daemon(raw_response=b"new"))
+        out = dump_body("fake-uid", "response", str(link))
+        assert "error" in out
+        assert "symlink" in out["error"]
+        # Decoy was NOT written through the symlink.
+        assert decoy.read_bytes() == b"original"
 
 
 # ---------------------------------------------------------------- export_har
@@ -731,6 +756,49 @@ class TestExportHar:
         har = json.loads((tmp_path / "host.har").read_text())
         urls = [e["request"]["url"] for e in har["log"]["entries"]]
         assert urls == ["https://a/"]
+
+    def test_ipv6_host_bracketed_on_synthesis(self, tmp_path: Path) -> None:
+        """When ``url`` is empty and we synthesize from connection,
+        IPv6 literals must be bracketed for Chrome's HAR import."""
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "",  # forces synthesis
+                    "host": "::1", "method": "GET", "status": 200,
+                }
+            ])
+        )
+        out = export_har(path=str(tmp_path / "ipv6.har"), uids=["u1"])
+        assert "error" not in out
+        har = json.loads((tmp_path / "ipv6.har").read_text())
+        # Synthesized URL must bracket the IPv6 literal.
+        assert har["log"]["entries"][0]["request"]["url"] == "https://[::1]/"
+
+    def test_no_host_skips_entry(self, tmp_path: Path) -> None:
+        """A capture with no resolvable host should be skipped rather
+        than emit an invalid URL Chrome would reject."""
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "", "host": "",  # totally unresolvable
+                    "method": "GET", "status": 200,
+                },
+                {
+                    "uid": "u2", "ob_id": 2,
+                    "url": "https://ok.test/", "host": "ok.test",
+                    "method": "GET", "status": 200,
+                },
+            ])
+        )
+        out = export_har(path=str(tmp_path / "skip.har"), uids=["u1", "u2"])
+        assert out["entry_count"] == 1
+        assert out["skipped_count"] == 1
 
     def test_iso_timestamp_format(self, tmp_path: Path) -> None:
         from reqable_mcp.tools.export import export_har
