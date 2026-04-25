@@ -819,3 +819,92 @@ class TestExportHar:
         ts = har["log"]["entries"][0]["startedDateTime"]
         assert ts.endswith(".123Z")
         assert ts.startswith("2023-")
+
+
+# ---------------------------------------------------------------- export_mitmproxy_flow
+
+
+class TestExportMitmproxyFlow:
+    def test_unfiltered_refused(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_mitmproxy_flow
+
+        set_daemon(_make_mock_daemon_for_har([]))
+        out = export_mitmproxy_flow(path=str(tmp_path / "x.flow"))
+        # Either mitmproxy missing or selector missing — both are
+        # error paths.
+        assert "error" in out
+
+    def test_relative_path_refused(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_mitmproxy_flow
+
+        set_daemon(_make_mock_daemon_for_har([{"uid": "u1"}]))
+        out = export_mitmproxy_flow(path="rel.flow", uids=["u1"])
+        assert "error" in out
+
+    def test_basic_export_when_mitmproxy_installed(
+        self, tmp_path: Path
+    ) -> None:
+        """If the mitmproxy package is importable, end-to-end works:
+        we read the file back with FlowReader and check the payload."""
+        pytest.importorskip("mitmproxy")
+        from mitmproxy.io import FlowReader
+
+        from reqable_mcp.tools.export import export_mitmproxy_flow
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://api.example.com/v1/login",
+                    "host": "api.example.com", "path": "/v1/login",
+                    "method": "POST", "status": 200,
+                    "ts": 1700000000000, "rtt_ms": 100,
+                    "req_headers": ["host: api.example.com"],
+                    "res_headers": ["content-type: application/json"],
+                    "req_body": b'{"u":"alice"}',
+                    "res_body": b'{"ok":true}',
+                }
+            ])
+        )
+        target = tmp_path / "out.flow"
+        out = export_mitmproxy_flow(path=str(target), uids=["u1"])
+        assert "error" not in out, out
+        assert out["flow_count"] == 1
+        # Read it back with mitmproxy's own reader.
+        with target.open("rb") as f:
+            flows = list(FlowReader(f).stream())
+        assert len(flows) == 1
+        assert flows[0].request.method == "POST"
+        assert flows[0].request.url == "https://api.example.com/v1/login"
+        assert flows[0].response.status_code == 200
+
+    def test_skip_count_for_missing_uid(self, tmp_path: Path) -> None:
+        pytest.importorskip("mitmproxy")
+        from reqable_mcp.tools.export import export_mitmproxy_flow
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {"uid": "u1", "ob_id": 1, "url": "https://x/", "host": "x",
+                 "method": "GET", "status": 200},
+            ])
+        )
+        out = export_mitmproxy_flow(
+            path=str(tmp_path / "skip.flow"), uids=["u1", "missing"],
+        )
+        assert out["flow_count"] == 1
+        assert out["skipped_count"] == 1
+
+    def test_missing_dep_returns_clean_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If mitmproxy isn't importable, the tool reports a friendly
+        error rather than crashing."""
+        from reqable_mcp.tools import export as _export
+
+        monkeypatch.setattr(_export, "_try_import_mitmproxy", lambda: None)
+        set_daemon(_make_mock_daemon_for_har([{"uid": "u1"}]))
+        out = _export.export_mitmproxy_flow(
+            path=str(tmp_path / "x.flow"), uids=["u1"],
+        )
+        assert "error" in out
+        assert "mitmproxy" in out["error"]

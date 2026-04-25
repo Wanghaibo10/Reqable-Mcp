@@ -39,6 +39,14 @@ export = [
   "brotli>=1",
   "zstandard>=0.20",
 ]
+# Pulls in mitmproxy itself for the ``export_mitmproxy_flow`` tool.
+# It's a heavy dependency (~100 MB across mitmproxy + cryptography +
+# tornado + pyOpenSSL + …), so it's its own extra rather than rolled
+# into ``export``. Only install if you actually want to feed flows
+# into mitmproxy's tooling.
+mitmproxy = [
+  "mitmproxy>=10",
+]
 
 [project.scripts]
 reqable-mcp = "reqable_mcp.__main__:main"
@@ -77,3 +85,11 @@ warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
 exclude = ["src/reqable_mcp/hook/template/.*"]
+
+# mitmproxy is an optional dep that internally uses Python 3.12+
+# syntax (type statement). We import it dynamically with try/except,
+# so mypy doesn't need to analyze it — skipping its imports stops
+# mypy from blowing up on a downstream syntax mismatch.
+[[tool.mypy.overrides]]
+module = "mitmproxy.*"
+follow_imports = "skip"

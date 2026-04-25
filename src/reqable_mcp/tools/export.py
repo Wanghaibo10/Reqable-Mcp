@@ -760,4 +760,220 @@ def export_har(
     }
 
 
+# ---------------------------------------------------------------- export_mitmproxy_flow
+
+
+def _try_import_mitmproxy():  # pragma: no cover - import path
+    try:
+        from mitmproxy import http as _http
+        from mitmproxy import io as _io
+        from mitmproxy.connection import Client as _Client
+        from mitmproxy.connection import Server as _Server
+    except ImportError:
+        return None
+    return {"http": _http, "io": _io, "Client": _Client, "Server": _Server}
+
+
+@mcp.tool()
+def export_mitmproxy_flow(
+    path: str,
+    uids: list[str] | None = None,
+    host: str | None = None,
+    window_minutes: int | None = None,
+    limit: int = _HAR_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Export captures to a mitmproxy ``.flow`` file.
+
+    The output is the binary tnetstring format mitmweb / mitmdump
+    natively read with ``--rfile``. Useful for replaying captures
+    through mitmproxy's scripting layer.
+
+    Selectors compose the same way as :func:`export_har`: at least
+    one of ``uids`` / ``host`` / ``window_minutes`` must be set.
+    Path must be absolute and not under Reqable's data dir.
+
+    Requires the ``mitmproxy`` package — install with
+    ``pip install 'reqable-mcp[mitmproxy]'``.
+
+    Returns ``{path, flow_count, skipped_count, size}`` or ``{error}``.
+    """
+    mods = _try_import_mitmproxy()
+    if mods is None:
+        return {
+            "error": (
+                "mitmproxy package not installed; "
+                "run `pip install 'reqable-mcp[mitmproxy]'`"
+            )
+        }
+
+    if not (uids or host or window_minutes):
+        return {
+            "error": (
+                "specify at least one of uids / host / window_minutes — "
+                "refusing to export every capture in the database"
+            )
+        }
+    if limit <= 0 or limit > _HAR_HARDCAP_ENTRIES:
+        return {
+            "error": (
+                f"limit must be in (0, {_HAR_HARDCAP_ENTRIES}], got {limit}"
+            )
+        }
+
+    target, err = _validate_dump_path(path)
+    if err is not None:
+        return {"error": err}
+    assert target is not None
+
+    daemon = get_daemon()
+    if daemon.db is None:
+        return {"error": "database unavailable"}
+
+    if uids:
+        target_uids: list[str] = list(uids)[:limit]
+    else:
+        from ..db import window_start_ms as _wsm
+        rows = daemon.db.query_recent(
+            limit=limit,
+            host=host,
+            since_ts_ms=(_wsm(window_minutes) if window_minutes else None),
+        )
+        target_uids = [r["uid"] for r in rows]
+
+    flows: list[Any] = []
+    skipped = 0
+    for uid in target_uids:
+        flow = _capture_to_mitmproxy_flow(uid, mods)
+        if flow is None:
+            skipped += 1
+            continue
+        flows.append(flow)
+
+    raw_target = Path(path).expanduser()
+    raw_target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(str(raw_target), flags, 0o600)
+    except OSError as e:
+        return {"error": f"open refused (symlink? {e})"}
+    try:
+        with os.fdopen(fd, "wb") as f:
+            writer = mods["io"].FlowWriter(f)
+            for flow in flows:
+                writer.add(flow)
+        size = raw_target.stat().st_size
+    except OSError as e:
+        return {"error": f"write failed: {e}"}
+
+    return {
+        "path": str(target),
+        "flow_count": len(flows),
+        "skipped_count": skipped,
+        "size": size,
+    }
+
+
+def _capture_to_mitmproxy_flow(uid: str, mods: dict) -> Any | None:
+    """Build one ``mitmproxy.http.HTTPFlow`` from a capture, or None
+    when the capture can't be reconstructed."""
+    import time as _time
+
+    daemon = get_daemon()
+    if daemon.db is None:
+        return None
+    row = daemon.db.get_capture(uid)
+    if row is None:
+        return None
+    full = (
+        daemon.lmdb_source.fetch_record(int(row["ob_id"]))
+        if daemon.lmdb_source is not None and row.get("ob_id")
+        else None
+    )
+
+    sess = (full or {}).get("session") or {}
+    cap_req = sess.get("request") or {}
+    cap_res = sess.get("response") or {}
+    rl = cap_req.get("requestLine") or {}
+
+    method = (rl.get("method") or row.get("method") or "GET").upper()
+    url = row.get("url") or ""
+    if not url:
+        conn = sess.get("connection") or {}
+        scheme = "https" if conn.get("security") else "http"
+        host = conn.get("originHost") or row.get("host") or ""
+        if not host:
+            return None
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        path = rl.get("path") or row.get("path") or "/"
+        url = f"{scheme}://{host}{path}"
+
+    # Headers list[str] → list[(bytes, bytes)] tuples — mitmproxy's
+    # Request.make / Response.make take bytes pairs.
+    # Drop pseudo-headers (h2 ``:method`` / ``:status`` etc.).
+    def _to_pairs(headers: list[str]) -> list[tuple[bytes, bytes]]:
+        pairs: list[tuple[bytes, bytes]] = []
+        for h in headers or []:
+            if not h or h.startswith(":"):
+                continue
+            name, sep, value = h.partition(":")
+            if not sep:
+                continue
+            try:
+                pairs.append(
+                    (name.strip().encode("latin-1"),
+                     value.strip().encode("latin-1"))
+                )
+            except UnicodeEncodeError:
+                # Header outside HTTP-supported charset — skip it.
+                continue
+        return pairs
+
+    # Bodies — best-effort. mitmproxy's Request.make/Response.make
+    # take bytes for the body.
+    req_body = b""
+    res_body = b""
+    if full is not None and daemon.body_source is not None:
+        lookup = lookup_from_record(full)
+        if lookup is not None:
+            req_body = daemon.body_source.get_request_body(lookup) or b""
+            res_body = daemon.body_source.get_response_body(
+                lookup, prefer_decoded=True
+            ) or b""
+
+    # noqa N806 throughout — these are class names rebound from a
+    # dict, not local variables in the conventional sense.
+    Client = mods["Client"]  # noqa: N806
+    Server = mods["Server"]  # noqa: N806
+    Request = mods["http"].Request  # noqa: N806
+    Response = mods["http"].Response  # noqa: N806
+    HTTPFlow = mods["http"].HTTPFlow  # noqa: N806
+
+    parsed_host = ""
+    parsed_port = 443
+    try:
+        from urllib.parse import urlparse as _urlparse
+        p = _urlparse(url)
+        parsed_host = p.hostname or ""
+        parsed_port = p.port or (443 if p.scheme == "https" else 80)
+    except Exception:  # noqa: BLE001
+        pass
+
+    now = _time.time()
+    client = Client(
+        peername=("127.0.0.1", 0),
+        sockname=("127.0.0.1", 0),
+        timestamp_start=now,
+    )
+    server = Server(address=(parsed_host or "unknown", parsed_port))
+    server.timestamp_start = now
+
+    flow = HTTPFlow(client, server)
+    flow.request = Request.make(method, url, req_body, _to_pairs(cap_req.get("headers") or []))
+    status = row.get("status") or 0
+    if status:
+        flow.response = Response.make(status, res_body, _to_pairs(cap_res.get("headers") or []))
+    return flow
+
+
 __all__: list[str] = []  # tools register via @mcp.tool
