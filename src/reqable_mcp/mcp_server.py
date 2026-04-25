@@ -70,6 +70,7 @@ def _import_all_tools() -> None:
         "reqable_mcp.tools.query",
         "reqable_mcp.tools.wait",
         "reqable_mcp.tools.analysis",
+        "reqable_mcp.tools.rules",
     ):
         try:
             __import__(mod_name)
