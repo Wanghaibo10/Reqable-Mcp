@@ -33,6 +33,7 @@ from reqable import *  # type: ignore[import-not-found]
 
 import json
 import os
+import re
 import socket
 import sys
 
@@ -152,6 +153,129 @@ def _extract_from_header(headers, field: str) -> str | None:
         return None
 
 
+def _patch_json_body(body, dotted_path: str, value) -> bool:
+    """Set ``body`` JSON ``dotted_path`` to ``value``. Returns True on
+    success, False if body is not text JSON or the path is unwalkable.
+
+    This *does* mutate ``msg.body``: the rule's purpose is to rewrite
+    one field of the in-flight payload. Reqable will re-serialize
+    after we return, so the bytes that go upstream / to the client
+    will reflect the change. (Contrast with ``relay_extract`` which
+    must NOT mutate.)
+
+    Walking semantics:
+    * ``""`` is rejected — caller must point at a specific field.
+    * Integer-only components index lists; otherwise treat as dict
+      keys. ``items.0.price`` works.
+    * Intermediate dict keys that don't exist are auto-created.
+    * Intermediate list indexes that don't exist fail (we don't
+      grow lists implicitly — too easy to corrupt).
+    """
+    if not dotted_path:
+        return False
+    try:
+        if not getattr(body, "isText", False):
+            return False
+        raw = body.payload
+    except Exception:  # noqa: BLE001
+        return False
+    if isinstance(raw, dict):
+        # Body was already jsonified earlier — work on the dict directly.
+        document: object = raw
+        was_dict = True
+    elif isinstance(raw, str):
+        try:
+            document = json.loads(raw)
+        except (ValueError, TypeError):
+            return False
+        was_dict = False
+    else:
+        return False
+    if not isinstance(document, (dict, list)):
+        return False
+
+    parts = dotted_path.split(".")
+    cursor = document
+    for i, part in enumerate(parts[:-1]):
+        if isinstance(cursor, dict):
+            if part not in cursor or not isinstance(cursor[part], (dict, list)):
+                # Auto-create missing intermediate dict nodes only when
+                # the *next* component looks like a dict key (not int).
+                next_part = parts[i + 1]
+                cursor[part] = [] if next_part.lstrip("-").isdigit() else {}
+            cursor = cursor[part]
+        elif isinstance(cursor, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return False
+            if not (0 <= idx < len(cursor)):
+                return False
+            cursor = cursor[idx]
+        else:
+            return False
+
+    leaf = parts[-1]
+    if isinstance(cursor, dict):
+        cursor[leaf] = value
+    elif isinstance(cursor, list):
+        try:
+            idx = int(leaf)
+        except ValueError:
+            return False
+        if not (0 <= idx < len(cursor)):
+            return False
+        cursor[idx] = value
+    else:
+        return False
+
+    # Write back. If the body was already a dict (some earlier rule
+    # jsonified it) leave it as a dict — Reqable serializer handles
+    # both. If it was text, replace the text payload.
+    if was_dict:
+        # Already mutated in place via cursor (it's the same object).
+        return True
+    body.text(json.dumps(document, ensure_ascii=False))  # type: ignore[attr-defined]
+    return True
+
+
+def _regex_replace_body(body, pattern: str, replacement: str,
+                        count: int, flags: int) -> bool:
+    """Run ``re.sub`` over ``body``'s text payload.
+
+    ``count=0`` means "replace all" (``re.sub`` semantics). Returns
+    True on success, False if body is not text or the pattern fails
+    to compile (we already pre-compiled in the daemon, but a corrupt
+    persisted rule can still get here).
+    """
+    try:
+        if not getattr(body, "isText", False):
+            return False
+        raw = body.payload
+    except Exception:  # noqa: BLE001
+        return False
+    if isinstance(raw, dict):
+        # Reqable's HttpBody can carry a parsed dict if a previous
+        # rule called .jsonify(). Re-serialize, regex over the text.
+        try:
+            text = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return False
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        return False
+    try:
+        new_text, n = re.subn(pattern, replacement, text, count=count, flags=flags)
+    except re.error:
+        return False
+    if n == 0:
+        # Nothing matched — don't bump hit counter, don't rewrite body.
+        return False
+    body.text(new_text)  # type: ignore[attr-defined]
+    return True
+
+
 def _extract_from_json_body(body, dotted_path: str) -> str | None:
     """Walk a dotted path through a JSON body. Returns str or None.
 
@@ -222,7 +346,9 @@ _HIGHLIGHTS = {
 _REQUEST_KIND_ORDER: dict[str, int] = {
     "relay_inject": 0,
     "inject_header": 1,
-    "replace_body": 2,
+    "patch_field": 2,        # surgical JSON patches
+    "regex_replace": 3,      # broader text rewrites
+    "replace_body": 4,       # whole-body replacement (last word)
     "tag": 9,
     "comment": 9,
 }
@@ -232,8 +358,10 @@ _REQUEST_KIND_ORDER: dict[str, int] = {
 _RESPONSE_KIND_ORDER: dict[str, int] = {
     "relay_extract": 0,
     "inject_header": 1,
-    "replace_body": 2,
-    "mock": 3,
+    "patch_field": 2,
+    "regex_replace": 3,
+    "replace_body": 4,
+    "mock": 5,
     "tag": 9,
     "comment": 9,
 }
@@ -271,6 +399,27 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
             if isinstance(name, str) and isinstance(value, str):
                 msg.headers[name] = value
                 return True
+        elif kind == "patch_field":
+            field_path = rule.get("field_path")
+            if not isinstance(field_path, str):
+                return False
+            # ``value`` can legitimately be None / 0 / "" / [] / {} —
+            # we only refuse to apply when the key is missing entirely.
+            if "value" not in rule:
+                return False
+            return _patch_json_body(msg.body, field_path, rule["value"])
+        elif kind == "regex_replace":
+            pattern = rule.get("pattern")
+            replacement = rule.get("replacement", "")
+            count = rule.get("count", 0)
+            flags_int = rule.get("flags", 0)
+            if not isinstance(pattern, str) or not isinstance(replacement, str):
+                return False
+            return _regex_replace_body(
+                msg.body, pattern, replacement,
+                int(count) if isinstance(count, int) else 0,
+                int(flags_int) if isinstance(flags_int, int) else 0,
+            )
         elif kind == "replace_body":
             body = rule.get("body")
             # bytes never reach here — IPC is JSON. str/dict only.

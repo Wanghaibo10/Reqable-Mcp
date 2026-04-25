@@ -745,3 +745,191 @@ class TestAutoTokenRelay:
             source_path_pattern="(unclosed",
         )
         assert "error" in out
+
+
+# ---------------------------------------------------------------- patch_body_field
+
+
+class TestPatchBodyField:
+    def test_basic_install(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="data.user.email",
+            value="alice@new.test",
+            host="api.example.com",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.kind == "patch_field"
+        assert rule.payload == {
+            "field_path": "data.user.email",
+            "value": "alice@new.test",
+        }
+
+    def test_value_can_be_null(self, daemon: Daemon) -> None:
+        """``value=None`` writes JSON ``null`` — must be allowed."""
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="optional", value=None, host="x",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].payload["value"] is None
+
+    def test_value_can_be_complex(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="items",
+            value=[{"id": 1}, {"id": 2}],
+            host="x",
+        )
+        assert "rule_id" in out
+
+    def test_empty_field_path_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(field_path="", value="x", host="x")
+        assert "error" in out
+        assert "field_path" in out["error"]
+
+    def test_dotted_edge_cases_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        for bad in (".leading", "trailing.", "double..dot"):
+            out = patch_body_field(field_path=bad, value="x", host="x")
+            assert "error" in out, bad
+
+    def test_path_too_long_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(field_path="a" * 257, value="x", host="x")
+        assert "error" in out
+        assert "≤ 256" in out["error"]
+
+    def test_oversize_value_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="x", value="a" * (BODY_MAX_BYTES + 1), host="x",
+        )
+        assert "error" in out
+        assert "BODY_MAX_BYTES" in out["error"]
+
+    def test_non_serializable_value_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="x", value=object(), host="x",  # type: ignore[arg-type]
+        )
+        assert "error" in out
+
+    def test_response_side(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import patch_body_field
+
+        out = patch_body_field(
+            field_path="ok", value=False, host="x", side="response",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].side == "response"
+
+
+# ---------------------------------------------------------------- replace_body_regex
+
+
+class TestReplaceBodyRegex:
+    def test_basic_install(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern=r"hello",
+            replacement="world",
+            host="x",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.kind == "regex_replace"
+        assert rule.payload["pattern"] == r"hello"
+        assert rule.payload["replacement"] == "world"
+        assert rule.payload["count"] == 0
+        assert rule.payload["flags"] == 0
+
+    def test_flags_compiled_to_int(self, daemon: Daemon) -> None:
+        import re as _re
+
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern=r"foo", replacement="bar", host="x",
+            flags=["i", "s"],
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        expected = _re.IGNORECASE | _re.DOTALL
+        assert daemon.rule_engine.list_all()[0].payload["flags"] == expected
+
+    def test_unknown_flag_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern=r"x", replacement="y", host="x", flags=["z"],
+        )
+        assert "error" in out
+        assert "flag" in out["error"]
+
+    def test_invalid_regex_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern=r"(unclosed", replacement="", host="x",
+        )
+        assert "error" in out
+        assert "compile" in out["error"]
+
+    def test_empty_pattern_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(pattern="", replacement="x", host="x")
+        assert "error" in out
+
+    def test_negative_count_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern="x", replacement="y", host="x", count=-1,
+        )
+        assert "error" in out
+
+    def test_pattern_too_large_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern="x" * 5000, replacement="", host="x",
+        )
+        assert "error" in out
+        assert "exceeds" in out["error"]
+
+    def test_count_one_for_first_match_only(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern="x", replacement="y", host="x", count=1,
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].payload["count"] == 1
+
+    def test_response_side(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body_regex
+
+        out = replace_body_regex(
+            pattern="x", replacement="y", host="x", side="response",
+        )
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].side == "response"

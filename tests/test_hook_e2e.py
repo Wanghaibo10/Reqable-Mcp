@@ -561,6 +561,211 @@ def test_relay_extract_runs_before_replace_body(hook_setup) -> None:
     assert d.relay_store.get("tok") == "original"
 
 
+def test_patch_body_field_request(hook_setup) -> None:
+    """patch_field rewrites a single JSON field in a request body."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {
+                    "text": '{"u":"alice","n":1,"deep":{"k":"old"}}',
+                    "charset": "UTF-8",
+                },
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_field", side="request",
+        host="api.example.com",
+        payload={"field_path": "deep.k", "value": "new"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    body_text = cb["request"]["body"]["payload"]["text"]
+    body = json.loads(body_text)
+    assert body == {"u": "alice", "n": 1, "deep": {"k": "new"}}
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+
+
+def test_patch_body_field_creates_missing_dict_keys(hook_setup) -> None:
+    """Intermediate dict keys auto-create."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": '{"u":"alice"}', "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_field", side="request",
+        host="api.example.com",
+        payload={"field_path": "meta.tag", "value": "vip"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    body = json.loads(cb["request"]["body"]["payload"]["text"])
+    assert body == {"u": "alice", "meta": {"tag": "vip"}}
+
+
+def test_patch_body_field_list_index(hook_setup) -> None:
+    """Integer-only path components index lists."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": '{"items":[{"p":1},{"p":2}]}', "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_field", side="request",
+        host="api.example.com",
+        payload={"field_path": "items.0.p", "value": 99},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    body = json.loads(cb["request"]["body"]["payload"]["text"])
+    assert body["items"][0]["p"] == 99
+    assert body["items"][1]["p"] == 2  # untouched
+
+
+def test_patch_body_field_silent_noop_on_non_json(hook_setup) -> None:
+    """Body that isn't JSON should be left alone, no hit recorded."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": "plain text not json", "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="patch_field", side="request",
+        host="api.example.com",
+        payload={"field_path": "x", "value": "y"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    assert cb["request"]["body"]["payload"]["text"] == "plain text not json"
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 0
+
+
+def test_regex_replace_body(hook_setup) -> None:
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": "old text and old again", "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="regex_replace", side="request",
+        host="api.example.com",
+        payload={"pattern": r"old", "replacement": "new", "count": 0, "flags": 0},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    assert cb["request"]["body"]["payload"]["text"] == "new text and new again"
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+
+
+def test_regex_replace_no_match_no_hit(hook_setup) -> None:
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": "no relevant content here", "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="regex_replace", side="request",
+        host="api.example.com",
+        payload={"pattern": r"missing", "replacement": "x", "count": 0, "flags": 0},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    # Body unchanged.
+    assert cb["request"]["body"]["payload"]["text"] == "no relevant content here"
+    time.sleep(0.05)
+    # Hit NOT recorded — re.subn returned 0 substitutions.
+    assert d.rule_engine.list_all()[0].hits == 0
+
+
+def test_patch_field_runs_before_replace_body(hook_setup) -> None:
+    """Apply order: patch_field must run before replace_body so the
+    surgical edit isn't clobbered by the wholesale replacement.
+    Actually with our priority, replace_body should win — this test
+    documents the contract."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": '{"u":"alice"}', "charset": "UTF-8"},
+            },
+        },
+    }
+    # patch_field tries to set u=bob, replace_body wholesale-replaces.
+    # With priority {patch_field=2, replace_body=4}, patch runs first
+    # then replace_body clobbers — final body is the replace_body output.
+    d.rule_engine.add(
+        kind="replace_body", side="request",
+        host="api.example.com",
+        payload={"body": {"final": True}},
+    )
+    d.rule_engine.add(
+        kind="patch_field", side="request",
+        host="api.example.com",
+        payload={"field_path": "u", "value": "bob"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    body = json.loads(cb["request"]["body"]["payload"]["text"])
+    assert body == {"final": True}, (
+        "replace_body wholesale-replaces — its output wins"
+    )
+
+
 def test_relay_extract_from_response_header(hook_setup) -> None:
     """source_loc='header' pulls a token from a response header
     (e.g. ``Set-Cookie`` or ``X-Token``)."""

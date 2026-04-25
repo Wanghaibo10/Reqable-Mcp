@@ -509,6 +509,207 @@ def block_request(
     return {"rule_id": rule.id, "expires_at": rule.expires_ts}
 
 
+# ---------------------------------------------------------------- patch_body_field
+# Tier 3 — surgical JSON field rewrite.
+
+# Cap on combined regex pattern + replacement length. Defends a tiny
+# bit against pathological catastrophic-backtracking patterns; not a
+# substitute for caller discipline.
+_REGEX_INPUT_MAX_BYTES: int = 4 * 1024
+
+
+def _validate_field_path(path: Any) -> str | None:
+    """Returns an error message if the path is unusable, else None."""
+    if not isinstance(path, str) or not path:
+        return "field_path must be a non-empty string"
+    if len(path) > 256:
+        return "field_path must be ≤ 256 chars"
+    if path.startswith(".") or path.endswith("."):
+        return "field_path cannot start or end with '.'"
+    if ".." in path:
+        return "field_path cannot contain empty components ('..')"
+    return None
+
+
+def _validate_patch_value(value: Any) -> str | None:
+    """JSON-serializable + size cap. ``None`` is legal (writes JSON null).
+    """
+    try:
+        encoded = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        return f"value not JSON-serializable: {e}"
+    try:
+        size = len(encoded.encode("utf-8"))
+    except UnicodeEncodeError as e:
+        return f"value not UTF-8 encodable: {e}"
+    if size > BODY_MAX_BYTES:
+        return f"value exceeds BODY_MAX_BYTES={BODY_MAX_BYTES}"
+    return None
+
+
+@mcp.tool()
+def patch_body_field(
+    field_path: str,
+    value: Any,
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    side: Literal["request", "response"] = "request",
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Rewrite a single JSON field inside the body, leaving everything
+    else intact.
+
+    Walking semantics for ``field_path`` (dotted):
+
+    * dict keys: ``data.user.email``
+    * list indexes (integer-only components): ``items.0.price``
+    * intermediate dict keys are auto-created when missing
+    * intermediate list indexes are NOT auto-extended (would corrupt)
+
+    ``value`` can be any JSON-encodable value (``str`` / ``int`` /
+    ``float`` / ``bool`` / ``None`` / ``dict`` / ``list``). Use
+    ``None`` to set a field to JSON ``null``.
+
+    Body must be text JSON. Non-JSON / binary bodies silently no-op
+    (the rule simply won't match — its hit count stays at zero).
+
+    **This rewrites real traffic.** Pair with a tight ``host`` /
+    ``path_pattern`` so this doesn't touch unrelated requests.
+    Default TTL 300s, max 3600s.
+
+    Returns ``{rule_id, expires_at}`` or ``{error}``.
+    """
+    err = _validate_field_path(field_path)
+    if err is not None:
+        return {"error": err}
+    err = _validate_patch_value(value)
+    if err is not None:
+        return {"error": err}
+
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="patch_field",
+            side=side,
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload={"field_path": field_path, "value": value},
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
+
+
+# ---------------------------------------------------------------- replace_body_regex
+# Tier 3 — text-level body rewrite via Python ``re.sub``.
+
+
+_VALID_REGEX_FLAGS: dict[str, int] = {
+    "i": __import__("re").IGNORECASE,
+    "m": __import__("re").MULTILINE,
+    "s": __import__("re").DOTALL,
+    "x": __import__("re").VERBOSE,
+}
+
+
+def _validate_regex_inputs(
+    pattern: str, replacement: str, count: int, flags: list[str] | None
+) -> tuple[int, str | None]:
+    """Return ``(flags_int, error)``. Pre-compiles to catch bad regex
+    on the daemon side before it reaches addons."""
+    if not isinstance(pattern, str) or not pattern:
+        return 0, "pattern must be a non-empty string"
+    if not isinstance(replacement, str):
+        return 0, "replacement must be a string"
+    if len(pattern.encode("utf-8")) + len(replacement.encode("utf-8")) > _REGEX_INPUT_MAX_BYTES:
+        return 0, (
+            f"pattern + replacement exceeds {_REGEX_INPUT_MAX_BYTES} bytes"
+        )
+    if not isinstance(count, int) or count < 0:
+        return 0, f"count must be a non-negative int, got {count!r}"
+    flags_int = 0
+    for f in flags or []:
+        if not isinstance(f, str) or f.lower() not in _VALID_REGEX_FLAGS:
+            return 0, (
+                f"unknown flag {f!r}; valid: "
+                f"{sorted(_VALID_REGEX_FLAGS.keys())}"
+            )
+        flags_int |= _VALID_REGEX_FLAGS[f.lower()]
+    import re as _re
+    try:
+        _re.compile(pattern, flags_int)
+    except _re.error as e:
+        return 0, f"pattern failed to compile: {e}"
+    return flags_int, None
+
+
+@mcp.tool()
+def replace_body_regex(
+    pattern: str,
+    replacement: str,
+    host: str | None = None,
+    path_pattern: str | None = None,
+    method: str | None = None,
+    side: Literal["request", "response"] = "request",
+    count: int = 0,
+    flags: list[str] | None = None,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Run ``re.sub(pattern, replacement, body)`` on matching traffic.
+
+    Operates on the body's text payload — non-text bodies silently
+    no-op. ``count=0`` means "replace all" (``re.sub`` semantics);
+    pass ``count=1`` to only rewrite the first match.
+
+    ``flags`` is a list of single-letter flags:
+    ``"i"`` (case-insensitive), ``"m"`` (multiline), ``"s"`` (dotall),
+    ``"x"`` (verbose). Pass ``None`` for no flags.
+
+    Pattern syntax is Python ``re`` — back-references in
+    ``replacement`` are ``\\1`` / ``\\g<name>`` etc. The pattern is
+    pre-compiled at install time so an invalid regex returns
+    ``{error}`` immediately rather than silently failing per request.
+
+    Caveat: ``re.sub`` has no built-in timeout. Avoid catastrophic
+    backtracking patterns like ``(a+)+$`` on adversarial bodies.
+
+    Pair with ``host`` / ``path_pattern`` so the rewrite scope is
+    narrow. Default TTL 300s.
+
+    Returns ``{rule_id, expires_at}`` or ``{error}``.
+    """
+    flags_int, err = _validate_regex_inputs(pattern, replacement, count, flags)
+    if err is not None:
+        return {"error": err}
+
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+    try:
+        rule = engine.add(
+            kind="regex_replace",
+            side=side,
+            host=host,
+            path_pattern=path_pattern,
+            method=method,
+            payload={
+                "pattern": pattern,
+                "replacement": replacement,
+                "count": count,
+                "flags": flags_int,
+            },
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"rule_id": rule.id, "expires_at": rule.expires_ts}
+
+
 # ---------------------------------------------------------------- auto_token_relay
 # Tier 3 — registers two coupled rules to ferry a token from one
 # host's response onto a later request to another host.
