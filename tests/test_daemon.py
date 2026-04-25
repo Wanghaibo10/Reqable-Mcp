@@ -70,3 +70,55 @@ def test_daemon_lmdb_source_runs(daemon: Daemon) -> None:
     time.sleep(0.6)
     assert daemon.lmdb_source is not None
     assert daemon.lmdb_source.stats.polls >= 1
+
+
+def test_rule_reaper_drops_expired(
+    real_lmdb_required: Path, short_data_dir: Path
+) -> None:
+    """Background reaper must remove rules whose ``expires_ts`` has
+    passed. We use a short interval + a directly-mutated rule to keep
+    the test fast and deterministic.
+    """
+    support = real_lmdb_required.parent
+    paths = resolve(reqable_support=support, our_data=short_data_dir)
+    d = Daemon(
+        paths=paths,
+        config=DaemonConfig(
+            strict_proxy=False, enable_ipc=False, reap_interval_seconds=0.1
+        ),
+    )
+    d.start()
+    try:
+        engine = d.rule_engine
+        assert engine is not None
+        rule = engine.add(
+            kind="tag", side="request",
+            host="reaper.test", payload={"color": "red"},
+            ttl_seconds=60,
+        )
+        # Force expiration without waiting 60s.
+        rule.expires_ts = time.time() - 1
+        # Two reap cycles is enough for the wait()+reap to fire.
+        time.sleep(0.4)
+        assert engine.list_all() == []
+    finally:
+        d.stop()
+
+
+def test_reaper_thread_joined_on_stop(
+    real_lmdb_required: Path, short_data_dir: Path
+) -> None:
+    support = real_lmdb_required.parent
+    paths = resolve(reqable_support=support, our_data=short_data_dir)
+    d = Daemon(
+        paths=paths,
+        config=DaemonConfig(
+            strict_proxy=False, enable_ipc=False, reap_interval_seconds=10.0
+        ),
+    )
+    d.start()
+    t = d._reaper_thread
+    assert t is not None and t.is_alive()
+    d.stop()
+    assert d._reaper_thread is None
+    assert not t.is_alive()

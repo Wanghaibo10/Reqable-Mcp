@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 
 import lmdb
@@ -34,6 +35,12 @@ from .wait_queue import WaitQueue
 # 4 KB is plenty for a tiny wrapper.
 _IPC_RULE_PAYLOAD_BUDGET: int = MAX_MESSAGE_BYTES - 4096
 
+# How often the background reaper drops expired rules from the engine.
+# Expired rules don't affect routing (``match_for`` filters by ``now``),
+# but they sit in memory and in ``rules.json`` until something prunes
+# them. Running this every 30s keeps the file small without wasting CPU.
+RULE_REAP_INTERVAL_S: float = 30.0
+
 log = logging.getLogger(__name__)
 
 
@@ -48,6 +55,10 @@ class DaemonConfig:
     enable_ipc: bool = True
     """Whether to start the Phase 2 IPC server. Tests / cmd_status
     can disable to avoid binding the socket file."""
+
+    reap_interval_seconds: float = RULE_REAP_INTERVAL_S
+    """How often the rule reaper runs. Override in tests to trigger
+    a sweep within a reasonable wait time."""
 
 
 class Daemon:
@@ -72,6 +83,8 @@ class Daemon:
         self.ipc_server: IpcServer | None = None
         self.schema: dict[str, Entity] = {}
         self._started = False
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------ start
 
@@ -139,6 +152,18 @@ class Daemon:
             )
             self.ipc_server.start()
 
+        # Start the rule reaper. ``match_for`` already ignores expired
+        # rules, but pruning them periodically keeps memory + the
+        # persisted rules.json from growing unbounded over a long-lived
+        # daemon. Daemon thread so it dies with the process.
+        self._reaper_stop.clear()
+        self._reaper_thread = threading.Thread(
+            target=self._reap_loop,
+            name="reqable-mcp-rule-reaper",
+            daemon=True,
+        )
+        self._reaper_thread.start()
+
         self._started = True
         log.info(
             "reqable-mcp daemon started — cache=%s lmdb=%s ipc=%s",
@@ -152,6 +177,12 @@ class Daemon:
     def stop(self) -> None:
         if not self._started:
             return
+        # Stop the reaper first; it never blocks long, but joining
+        # before tearing down rule_engine avoids a benign race.
+        self._reaper_stop.set()
+        if self._reaper_thread is not None:
+            self._reaper_thread.join(timeout=2.0)
+            self._reaper_thread = None
         if self.ipc_server is not None:
             try:
                 self.ipc_server.stop()
@@ -164,6 +195,25 @@ class Daemon:
                 log.exception("lmdb_source.stop failed")
         self._started = False
         log.info("reqable-mcp daemon stopped")
+
+    def _reap_loop(self) -> None:
+        """Background loop: prune expired rules every
+        :data:`RULE_REAP_INTERVAL_S` seconds. Stops when ``stop()``
+        sets ``_reaper_stop`` (we use ``Event.wait`` so shutdown is
+        responsive instead of sleeping the full interval).
+        """
+        interval = self.config.reap_interval_seconds
+        while not self._reaper_stop.wait(timeout=interval):
+            engine = self.rule_engine
+            if engine is None:
+                continue
+            try:
+                dropped = engine.reap_expired()
+            except Exception:
+                log.exception("rule reaper failed")
+                continue
+            if dropped:
+                log.info("rule reaper dropped %d expired rule(s)", dropped)
 
     # ------------------------------------------------------------------ ipc
 
