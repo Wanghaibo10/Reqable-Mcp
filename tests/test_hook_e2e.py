@@ -888,6 +888,44 @@ def test_dry_run_replace_body_does_not_mutate(hook_setup) -> None:
     assert d.dry_run_log.stats()["total_entries"] == 1
 
 
+def test_status_filtered_tag_matches_4xx(hook_setup) -> None:
+    """A response-side tag scoped to status 400-499 should fire on a
+    404 capture but not a 200 capture."""
+    d = hook_setup["daemon"]
+    rule = d.rule_engine.add(
+        kind="tag", side="response",
+        host="api.example.com",
+        payload={"color": "red"},
+        status_min=400, status_max=499,
+    )
+    # 404 sample
+    sample_404 = {
+        "context": {**SAMPLE_RESPONSE["context"]},  # type: ignore[arg-type]
+        "response": {
+            **SAMPLE_RESPONSE["response"],  # type: ignore[arg-type]
+            "code": 404,
+            "message": "Not Found",
+        },
+    }
+    cb = _run_hook(
+        hook_setup["hook_dir"], "response", sample_404,
+        socket_path=hook_setup["socket"],
+    )
+    # Highlight = red (1 in Reqable's enum) — proof rule applied.
+    assert cb["highlight"] == 1
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+    # Now a 200 — must NOT fire.
+    cb2 = _run_hook(
+        hook_setup["hook_dir"], "response", SAMPLE_RESPONSE,
+        socket_path=hook_setup["socket"],
+    )
+    assert cb2.get("highlight") is None
+    time.sleep(0.05)
+    by_id = {r.id: r for r in d.rule_engine.list_all()}
+    assert by_id[rule.id].hits == 1  # still 1
+
+
 def test_dry_run_block_coexists_with_real_block(hook_setup) -> None:
     """If both a real block and a dry-run block match, the real one
     still aborts, but the dry-run one is also credited with a hit."""

@@ -58,6 +58,8 @@ def _serialize_rule(r: Rule) -> dict[str, Any]:
         "expires_ts": r.expires_ts,
         "hits": r.hits,
         "dry_run": r.dry_run,
+        "status_min": r.status_min,
+        "status_max": r.status_max,
     }
 
 
@@ -78,6 +80,8 @@ def tag_pattern(
     path_pattern: str | None = None,
     method: str | None = None,
     color: str = "red",
+    status_min: int | None = None,
+    status_max: int | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> dict[str, Any]:
     """Highlight matching captures in Reqable's UI with a color.
@@ -89,6 +93,11 @@ def tag_pattern(
     Filters are AND-combined; ``None`` means "any". ``path_pattern``
     is a Python regex applied to the request path with ``re.search``.
 
+    ``status_min`` / ``status_max`` (response-side only): inclusive
+    HTTP status filter. Pass ``status_min=400, status_max=499`` for
+    "all 4xx responses red". The rule auto-runs on the response side
+    when either bound is set.
+
     Colors: ``red`` / ``yellow`` / ``green`` / ``blue`` / ``teal`` /
     ``strikethrough``.
 
@@ -96,18 +105,28 @@ def tag_pattern(
     """
     if color not in _VALID_COLORS:
         return {"error": f"color must be one of {_VALID_COLORS}, got {color!r}"}
+    # Status filter implies response-side. tag_pattern is otherwise a
+    # request-side rule because ``context.highlight`` writes back from
+    # either side and Reqable shows the same color in the list.
+    side: Literal["request", "response"] = (
+        "response"
+        if (status_min is not None or status_max is not None)
+        else "request"
+    )
     engine = _engine_or_error()
     if engine is None:
         return {"error": "rule engine not available — daemon not fully started"}
     try:
         rule = engine.add(
             kind="tag",
-            side="request",
+            side=side,
             host=host,
             path_pattern=path_pattern,
             method=method,
             payload={"color": color},
             ttl_seconds=ttl_seconds,
+            status_min=status_min,
+            status_max=status_max,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -123,6 +142,8 @@ def comment_pattern(
     host: str | None = None,
     path_pattern: str | None = None,
     method: str | None = None,
+    status_min: int | None = None,
+    status_max: int | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> dict[str, Any]:
     """Attach a free-form comment to matching captures.
@@ -131,21 +152,31 @@ def comment_pattern(
     ``comment_pattern(text="step 2 token request", host="api.x.com",
     path_pattern="/oauth/token")`` then later ``list_recent`` shows
     those captures with the comment attached in the LMDB record.
+
+    Pass ``status_min`` / ``status_max`` to scope the comment to a
+    response-status range (e.g. annotate every 5xx).
     """
     if not text or len(text) > 500:
         return {"error": "text must be a non-empty string up to 500 chars"}
+    side: Literal["request", "response"] = (
+        "response"
+        if (status_min is not None or status_max is not None)
+        else "request"
+    )
     engine = _engine_or_error()
     if engine is None:
         return {"error": "rule engine not available — daemon not fully started"}
     try:
         rule = engine.add(
             kind="comment",
-            side="request",
+            side=side,
             host=host,
             path_pattern=path_pattern,
             method=method,
             payload={"text": text},
             ttl_seconds=ttl_seconds,
+            status_min=status_min,
+            status_max=status_max,
         )
     except ValueError as e:
         return {"error": str(e)}

@@ -91,16 +91,19 @@ def _ipc_call(op: str, args: dict) -> dict | None:
 
 def _fetch_rules(side: str, context, msg) -> list[dict]:
     """Ask the daemon for rules to apply to this in-flight message."""
+    args: dict = {"side": side, "host": context.host}
     if side == "request":
-        method = msg.method
-        path = msg.path
+        args["method"] = msg.method
+        args["path"] = msg.path
     else:
-        method = msg.request.method
-        path = msg.request.path
-    resp = _ipc_call(
-        "get_rules",
-        {"side": side, "host": context.host, "path": path, "method": method},
-    )
+        args["method"] = msg.request.method
+        args["path"] = msg.request.path
+        # Status feeds rule status_min/status_max filters. Only known
+        # on the response side.
+        code = getattr(msg, "code", None)
+        if isinstance(code, int):
+            args["status"] = code
+    resp = _ipc_call("get_rules", args)
     if resp is None or not resp.get("ok"):
         return []
     data = resp.get("data") or []

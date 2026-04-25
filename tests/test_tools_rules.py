@@ -1018,3 +1018,103 @@ class TestDryRunPlumbing:
         assert "rule_id" in out
         assert daemon.rule_engine is not None
         assert daemon.rule_engine.list_all()[0].dry_run is True
+
+
+# ---------------------------------------------------------------- status filter
+
+
+class TestStatusFilter:
+    def test_tag_with_status_range_uses_response_side(
+        self, daemon: Daemon
+    ) -> None:
+        from reqable_mcp.tools.rules import tag_pattern
+
+        out = tag_pattern(host="x", status_min=400, status_max=499)
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.side == "response"
+        assert rule.status_min == 400
+        assert rule.status_max == 499
+
+    def test_tag_without_status_stays_on_request_side(
+        self, daemon: Daemon
+    ) -> None:
+        from reqable_mcp.tools.rules import tag_pattern
+
+        tag_pattern(host="x")
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].side == "request"
+
+    def test_invalid_status_min(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import tag_pattern
+
+        out = tag_pattern(host="x", status_min=99)
+        assert "error" in out
+
+    def test_status_min_greater_than_max(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import tag_pattern
+
+        out = tag_pattern(host="x", status_min=500, status_max=200)
+        assert "error" in out
+
+    def test_match_for_filters_by_status(
+        self, daemon: Daemon
+    ) -> None:
+        """Engine-level filter: a 4xx-only rule shouldn't match a 200."""
+        engine = daemon.rule_engine
+        assert engine is not None
+        rule = engine.add(
+            kind="tag", side="response",
+            host="api.example.com",
+            payload={"color": "red"},
+            status_min=400, status_max=499,
+        )
+        # 200 → no match
+        assert engine.match_for(
+            side="response", host="api.example.com",
+            path="/x", method="GET", status=200,
+        ) == []
+        # 404 → matches
+        matches = engine.match_for(
+            side="response", host="api.example.com",
+            path="/x", method="GET", status=404,
+        )
+        assert len(matches) == 1
+        assert matches[0].id == rule.id
+        # No status given (e.g. on request side or aborted) → no match
+        # (the filter exists, must be evaluated).
+        assert engine.match_for(
+            side="response", host="api.example.com",
+            path="/x", method="GET",
+        ) == []
+
+    def test_status_min_only_matches_500_plus(
+        self, daemon: Daemon
+    ) -> None:
+        engine = daemon.rule_engine
+        assert engine is not None
+        engine.add(
+            kind="tag", side="response", host="x",
+            payload={"color": "yellow"},
+            status_min=500,
+        )
+        assert engine.match_for(
+            side="response", host="x", path="/", method="GET", status=200,
+        ) == []
+        assert len(engine.match_for(
+            side="response", host="x", path="/", method="GET", status=503,
+        )) == 1
+
+    def test_status_filter_request_side_rejected(
+        self, daemon: Daemon
+    ) -> None:
+        """Engine refuses status_min/max on a request-side rule —
+        request hasn't received a status yet."""
+        engine = daemon.rule_engine
+        assert engine is not None
+        with pytest.raises(ValueError, match="response-side"):
+            engine.add(
+                kind="tag", side="request", host="x",
+                payload={"color": "red"}, status_min=400,
+            )

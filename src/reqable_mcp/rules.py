@@ -99,6 +99,13 @@ class Rule:
     created_ts: float
     expires_ts: float | None
     hits: int = 0
+    # Optional inclusive HTTP status filter, evaluated on the response
+    # side only. ``None`` on either bound means "unbounded that side".
+    # ``status_min=400, status_max=499`` matches 4xx; ``status_min=500``
+    # alone matches everything 500+. Request-side rules ignore these
+    # (the status doesn't exist yet).
+    status_min: int | None = None
+    status_max: int | None = None
     # dry_run=True turns off the mutation half of every rule kind: the
     # addons hook still records that the rule matched (it bumps hits
     # and reports a structured "would have done X" event the operator
@@ -116,7 +123,13 @@ class Rule:
                 raise ValueError(f"invalid path_pattern regex: {e}") from e
 
     def matches(
-        self, *, side: str, host: str | None, path: str | None, method: str | None
+        self,
+        *,
+        side: str,
+        host: str | None,
+        path: str | None,
+        method: str | None,
+        status: int | None = None,
     ) -> bool:
         if side != self.side:
             return False
@@ -124,7 +137,19 @@ class Rule:
             return False
         if self.method is not None and (method or "").upper() != self.method:
             return False
-        return not (self._path_re is not None and not self._path_re.search(path or ""))
+        if self._path_re is not None and not self._path_re.search(path or ""):
+            return False
+        if self.status_min is not None or self.status_max is not None:
+            # Status filter only applies on the response side; if no
+            # status was supplied (request side, or not yet known) we
+            # treat the rule as not matching to avoid false positives.
+            if not isinstance(status, int):
+                return False
+            if self.status_min is not None and status < self.status_min:
+                return False
+            if self.status_max is not None and status > self.status_max:
+                return False
+        return True
 
     def is_expired(self, *, now: float | None = None) -> bool:
         if self.expires_ts is None:
@@ -160,6 +185,8 @@ class Rule:
         "expires_ts": (int, float, type(None)),
         "hits": int,
         "dry_run": bool,
+        "status_min": (int, type(None)),
+        "status_max": (int, type(None)),
     }
 
     @classmethod
@@ -270,6 +297,8 @@ class RuleEngine:
         method: str | None = None,
         ttl_seconds: int | None = DEFAULT_TTL_SECONDS,
         dry_run: bool = False,
+        status_min: int | None = None,
+        status_max: int | None = None,
     ) -> Rule:
         if kind not in VALID_KINDS:
             raise ValueError(f"invalid kind {kind!r}; must be one of {sorted(VALID_KINDS)}")
@@ -285,6 +314,20 @@ class RuleEngine:
         if kind == "relay_inject" and side != "request":
             raise ValueError("kind='relay_inject' must use side='request'")
         expires = _validated_ttl(ttl_seconds)
+        # Status filter sanity. The actual range check lives at install
+        # time in the tool layer; here we just refuse the obviously bad.
+        if status_min is not None and (status_min < 100 or status_min > 599):
+            raise ValueError(f"status_min must be in [100, 599], got {status_min}")
+        if status_max is not None and (status_max < 100 or status_max > 599):
+            raise ValueError(f"status_max must be in [100, 599], got {status_max}")
+        if (
+            status_min is not None
+            and status_max is not None
+            and status_min > status_max
+        ):
+            raise ValueError("status_min cannot exceed status_max")
+        if (status_min is not None or status_max is not None) and side != "response":
+            raise ValueError("status filters only apply on response-side rules")
         rule = Rule(
             id=uuid.uuid4().hex,
             kind=kind,
@@ -296,6 +339,8 @@ class RuleEngine:
             created_ts=time.time(),
             expires_ts=expires,
             dry_run=bool(dry_run),
+            status_min=status_min,
+            status_max=status_max,
         )
         with self._lock:
             self._rules[rule.id] = rule
@@ -357,11 +402,14 @@ class RuleEngine:
         host: str | None,
         path: str | None,
         method: str | None,
+        status: int | None = None,
     ) -> list[Rule]:
         """Return rules to apply for this in-flight request/response.
 
         Filters out expired rules. Caller should call :meth:`record_hit`
-        on each rule it actually applied.
+        on each rule it actually applied. ``status`` is only meaningful
+        on response-side calls and feeds the status_min/status_max
+        rule filters added in M19.
         """
         now = time.time()
         with self._lock:
@@ -369,7 +417,10 @@ class RuleEngine:
                 r
                 for r in self._rules.values()
                 if not r.is_expired(now=now)
-                and r.matches(side=side, host=host, path=path, method=method)
+                and r.matches(
+                    side=side, host=host, path=path,
+                    method=method, status=status,
+                )
             ]
 
     def stats(self) -> dict[str, Any]:

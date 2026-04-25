@@ -248,11 +248,13 @@ class Daemon:
 
         if req.op == "get_rules":
             args = req.args
+            status_arg = args.get("status")
             rules = self.rule_engine.match_for(
                 side=args.get("side", ""),
                 host=args.get("host"),
                 path=args.get("path"),
                 method=args.get("method"),
+                status=status_arg if isinstance(status_arg, int) else None,
             )
             payloads = self._pack_rules_for_ipc(rules, args)
             return ok_response(payloads)
