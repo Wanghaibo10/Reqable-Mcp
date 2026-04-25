@@ -1,12 +1,15 @@
 """Phase 3 — body decoding, pretty-printing, and dumping to local files.
 
-Three closely-related tools that share the body-fetch + decode plumbing:
+Four MCP tools share the body-fetch + decode plumbing:
 
 * ``decode_body`` — fetch raw bytes, walk the ``Content-Encoding``
   chain (gzip / deflate / br / zstd), return decoded text.
 * ``prettify``   — decode, then indent JSON / XML / HTML.
 * ``dump_body``  — write the decoded body to a local file (with a
   guard against writing into Reqable's own data directory).
+* ``export_har`` — write a batch of captures as HAR 1.2 to a local
+  file. Compatible with Chrome DevTools / Firefox / Postman /
+  Charles import.
 
 Brotli and zstd codecs require optional dependencies — install
 ``reqable-mcp[export]`` to enable them. Without those packages the
@@ -16,6 +19,7 @@ respective codecs return a clean error rather than crashing.
 from __future__ import annotations
 
 import base64
+import datetime as _dt
 import gzip
 import html
 import json
@@ -24,7 +28,9 @@ import re  # used by _pretty_html
 import zlib
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlparse
 
+from ..db import window_start_ms
 from ..mcp_server import get_daemon, mcp
 from ..sources.body_source import lookup_from_record
 
@@ -442,6 +448,284 @@ def dump_body(
     if decode_err is not None:
         out["decode_error"] = decode_err
     return out
+
+
+# ---------------------------------------------------------------- export_har
+#
+# HAR 1.2 spec: https://w3c.github.io/web-performance/specs/HAR/Overview.html
+#
+# We emit the minimum-viable subset that DevTools / Charles / Postman
+# accept:
+#   log.version, log.creator, log.entries[]
+#   entries[].startedDateTime, .time, .request, .response, .cache, .timings
+# Cookies, queryString, postData are filled when we can extract them
+# cheaply from the captured headers / body.
+
+_HAR_HARDCAP_ENTRIES: int = 10_000
+_HAR_DEFAULT_LIMIT: int = 1_000
+
+# Standard HTTP status text — used as fallback when Reqable doesn't
+# surface ``message`` (it usually does for 1.x but not for h2/h3).
+_STATUS_TEXT: dict[int, str] = {
+    100: "Continue", 101: "Switching Protocols",
+    200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+    206: "Partial Content",
+    301: "Moved Permanently", 302: "Found", 303: "See Other",
+    304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+    404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout",
+    409: "Conflict", 410: "Gone", 415: "Unsupported Media Type",
+    422: "Unprocessable Entity", 429: "Too Many Requests",
+    500: "Internal Server Error", 501: "Not Implemented",
+    502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
+}
+
+
+def _name_value_pairs(headers: list[str]) -> list[dict[str, str]]:
+    """Reqable header strings ``"name: value"`` → HAR ``[{name, value}]``.
+    Pseudo-headers (``:method`` etc.) are dropped."""
+    out: list[dict[str, str]] = []
+    for h in headers or []:
+        if not h or h.startswith(":"):
+            continue
+        name, sep, value = h.partition(":")
+        if not sep:
+            continue
+        out.append({"name": name.strip(), "value": value.strip()})
+    return out
+
+
+def _ts_to_iso(ts_ms: int | None) -> str:
+    """Reqable stores ts in unix-ms. HAR wants ISO 8601 in UTC."""
+    if ts_ms is None:
+        return "1970-01-01T00:00:00.000Z"
+    return (
+        _dt.datetime.fromtimestamp(ts_ms / 1000, tz=_dt.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{ts_ms % 1000:03d}Z"
+    )
+
+
+def _capture_to_har_entry(uid: str) -> dict[str, Any] | None:
+    """Build one HAR entry for a capture. Returns None if missing."""
+    daemon = get_daemon()
+    if daemon.db is None:
+        return None
+    row = daemon.db.get_capture(uid)
+    if row is None:
+        return None
+    full = (
+        daemon.lmdb_source.fetch_record(int(row["ob_id"]))
+        if daemon.lmdb_source is not None and row.get("ob_id")
+        else None
+    )
+
+    sess = (full or {}).get("session") or {}
+    cap_req = sess.get("request") or {}
+    cap_res = sess.get("response") or {}
+    rl = cap_req.get("requestLine") or {}
+
+    method = (rl.get("method") or row.get("method") or "GET").upper()
+    url = row.get("url") or ""
+    if not url:
+        conn = sess.get("connection") or {}
+        scheme = "https" if conn.get("security") else "http"
+        host = conn.get("originHost") or row.get("host") or ""
+        path = rl.get("path") or row.get("path") or "/"
+        url = f"{scheme}://{host}{path}"
+
+    parsed = urlparse(url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    http_version = (cap_req.get("protocol") or row.get("protocol") or "HTTP/1.1").upper()
+    if http_version == "H2":
+        http_version = "HTTP/2"
+    elif http_version == "H3":
+        http_version = "HTTP/3"
+
+    # Body: prefer decoded plaintext; if binary, base64. We don't dump
+    # request bodies into HAR for non-body methods (GET/HEAD/OPTIONS).
+    req_post: dict[str, Any] | None = None
+    if (
+        method in ("POST", "PUT", "PATCH", "DELETE")
+        and full is not None
+        and daemon.body_source is not None
+    ):
+        lookup = lookup_from_record(full)
+        if lookup is not None:
+            raw = daemon.body_source.get_request_body(lookup)
+            if raw:
+                # Try Content-Encoding decode; fall back to raw.
+                ce = _content_encoding_from(cap_req.get("headers") or [])
+                if ce:
+                    decoded, _, _ = _walk_content_encoding(raw, ce)
+                else:
+                    decoded = raw
+                ct = _content_type_from(cap_req.get("headers") or []) or "application/octet-stream"
+                text, enc = _decode_text(decoded)
+                if enc == "base64":
+                    req_post = {"mimeType": ct, "text": text, "encoding": "base64"}
+                else:
+                    req_post = {"mimeType": ct, "text": text}
+
+    # Response body
+    res_content: dict[str, Any] = {
+        "size": row.get("res_body_size") or -1,
+        "mimeType": row.get("res_mime") or "",
+    }
+    if full is not None and daemon.body_source is not None:
+        lookup = lookup_from_record(full)
+        if lookup is not None:
+            raw = daemon.body_source.get_response_body(lookup, prefer_decoded=True)
+            if raw:
+                text, enc = _decode_text(raw)
+                if enc == "base64":
+                    res_content["text"] = text
+                    res_content["encoding"] = "base64"
+                else:
+                    res_content["text"] = text
+
+    # redirectURL: pull Location header from response if 3xx
+    redirect_url = ""
+    status = row.get("status") or 0
+    if 300 <= status < 400:
+        for h in cap_res.get("headers") or []:
+            kv = h.partition(":")
+            if kv[0].strip().lower() == "location" and kv[1]:
+                redirect_url = kv[2].strip()
+                break
+
+    rtt = row.get("rtt_ms") or 0
+    status_message = (
+        cap_res.get("message") or _STATUS_TEXT.get(status, "")
+    )
+    ts_ms = row.get("ts")
+    started_iso = _ts_to_iso(ts_ms)
+
+    return {
+        "startedDateTime": started_iso,
+        "time": rtt,
+        "request": {
+            "method": method,
+            "url": url,
+            "httpVersion": http_version,
+            "cookies": [],
+            "headers": _name_value_pairs(cap_req.get("headers") or []),
+            "queryString": [{"name": k, "value": v} for k, v in query_pairs],
+            "headersSize": -1,
+            "bodySize": row.get("req_body_size") or 0,
+            **({"postData": req_post} if req_post is not None else {}),
+        },
+        "response": {
+            "status": status,
+            "statusText": status_message,
+            "httpVersion": http_version,
+            "cookies": [],
+            "headers": _name_value_pairs(cap_res.get("headers") or []),
+            "content": res_content,
+            "redirectURL": redirect_url,
+            "headersSize": -1,
+            "bodySize": row.get("res_body_size") or -1,
+        },
+        "cache": {},
+        "timings": {
+            "send": 0,
+            "wait": rtt,
+            "receive": 0,
+        },
+        "_reqable_uid": uid,
+        "_app_name": row.get("app_name"),
+    }
+
+
+@mcp.tool()
+def export_har(
+    path: str,
+    uids: list[str] | None = None,
+    host: str | None = None,
+    window_minutes: int | None = None,
+    limit: int = _HAR_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Export captures to a HAR 1.2 file (Chrome DevTools / Postman / Charles).
+
+    At least one selector must be specified — refusing the unfiltered
+    case prevents accidentally writing every capture in history. The
+    selectors compose:
+
+    * ``uids`` — explicit list. Wins over the other filters when given.
+    * ``host`` + ``window_minutes`` — pull recent captures matching
+      both. ``window_minutes`` alone exports everything in the window.
+    * ``host`` alone — last ``limit`` captures for that host.
+
+    Output cap: ``limit`` (default 1000, hardcap 10000). Path must be
+    absolute and not under Reqable's own data directory.
+
+    Returns ``{path, entry_count, skipped_count, size}`` or ``{error}``.
+    """
+    if not (uids or host or window_minutes):
+        return {
+            "error": (
+                "specify at least one of uids / host / window_minutes — "
+                "refusing to export every capture in the database"
+            )
+        }
+    if limit <= 0 or limit > _HAR_HARDCAP_ENTRIES:
+        return {
+            "error": (
+                f"limit must be in (0, {_HAR_HARDCAP_ENTRIES}], got {limit}"
+            )
+        }
+
+    target, err = _validate_dump_path(path)
+    if err is not None:
+        return {"error": err}
+    assert target is not None
+
+    daemon = get_daemon()
+    if daemon.db is None:
+        return {"error": "database unavailable"}
+
+    if uids:
+        # Explicit list — preserve caller order, cap at limit.
+        target_uids: list[str] = list(uids)[:limit]
+    else:
+        rows = daemon.db.query_recent(
+            limit=limit,
+            host=host,
+            since_ts_ms=(window_start_ms(window_minutes) if window_minutes else None),
+        )
+        target_uids = [r["uid"] for r in rows]
+
+    entries: list[dict[str, Any]] = []
+    skipped = 0
+    for u in target_uids:
+        entry = _capture_to_har_entry(u)
+        if entry is None:
+            skipped += 1
+            continue
+        entries.append(entry)
+
+    har = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "reqable-mcp", "version": "0.1.0a1"},
+            "entries": entries,
+        }
+    }
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("w", encoding="utf-8") as f:
+            json.dump(har, f, ensure_ascii=False, indent=2)
+        size = target.stat().st_size
+    except OSError as e:
+        return {"error": f"write failed: {e}"}
+
+    return {
+        "path": str(target),
+        "entry_count": len(entries),
+        "skipped_count": skipped,
+        "size": size,
+    }
 
 
 __all__: list[str] = []  # tools register via @mcp.tool

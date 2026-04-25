@@ -415,3 +415,339 @@ class TestDumpBodyTool:
         out = dump_body("fake-uid", "response", str(target))
         assert target.read_bytes() == b"hi"
         assert "error" not in out
+
+
+# ---------------------------------------------------------------- export_har
+
+
+def _make_mock_daemon_for_har(captures: list[dict[str, Any]]) -> Any:
+    """Build a daemon mock with multiple captures preloaded.
+
+    Each entry is ``{uid, ob_id, url, host, method, status, ts,
+    rtt_ms, ?req_body_size, ?res_body_size, ?req_mime, ?res_mime,
+    ?app_name, ?protocol, ?req_headers, ?res_headers,
+    ?req_body, ?res_body}``.
+    """
+    daemon = MagicMock()
+
+    by_uid = {c["uid"]: c for c in captures}
+
+    def get_capture(uid: str):
+        c = by_uid.get(uid)
+        if c is None:
+            return None
+        return {
+            "uid": c["uid"],
+            "ob_id": c.get("ob_id", 1),
+            "url": c.get("url", ""),
+            "host": c.get("host", ""),
+            "path": c.get("path", "/"),
+            "method": c.get("method", "GET"),
+            "status": c.get("status"),
+            "protocol": c.get("protocol", "HTTP/1.1"),
+            "ts": c.get("ts", 1700000000000),
+            "rtt_ms": c.get("rtt_ms", 0),
+            "req_body_size": c.get("req_body_size", 0),
+            "res_body_size": c.get("res_body_size", 0),
+            "req_mime": c.get("req_mime"),
+            "res_mime": c.get("res_mime"),
+            "app_name": c.get("app_name"),
+        }
+
+    daemon.db.get_capture.side_effect = get_capture
+
+    def query_recent(*, limit: int = 20, host=None, since_ts_ms=None, **_kw):
+        rows = []
+        for c in captures:
+            if host and c.get("host") != host:
+                continue
+            if since_ts_ms and c.get("ts", 0) < since_ts_ms:
+                continue
+            rows.append(get_capture(c["uid"]))
+        return rows[:limit]
+
+    daemon.db.query_recent.side_effect = query_recent
+
+    def fetch_record(ob_id: int):
+        # Find the capture whose ob_id matches.
+        for c in captures:
+            if c.get("ob_id", 1) == ob_id:
+                return {
+                    "session": {
+                        "id": 1,
+                        "request": {
+                            "requestLine": {
+                                "method": c.get("method", "GET"),
+                                "path": c.get("path", "/"),
+                            },
+                            "protocol": c.get("protocol", "HTTP/1.1"),
+                            "headers": c.get("req_headers", []),
+                        },
+                        "response": {
+                            "headers": c.get("res_headers", []),
+                            "message": c.get("status_message"),
+                        },
+                        "connection": {
+                            "originHost": c.get("host", ""),
+                            "security": True,
+                            "timestamp": c.get("ob_id", 1),
+                            "id": 1,
+                        },
+                    }
+                }
+        return None
+
+    daemon.lmdb_source.fetch_record.side_effect = fetch_record
+
+    def get_request_body(lookup):
+        for c in captures:
+            if c.get("ob_id", 1) == lookup.conn_timestamp:
+                return c.get("req_body")
+        return None
+
+    def get_response_body(lookup, *, prefer_decoded=True):
+        for c in captures:
+            if c.get("ob_id", 1) == lookup.conn_timestamp:
+                return c.get("res_body")
+        return None
+
+    daemon.body_source.get_request_body.side_effect = get_request_body
+    daemon.body_source.get_response_body.side_effect = get_response_body
+    daemon.body_source.get_response_raw.side_effect = get_response_body
+
+    return daemon
+
+
+class TestExportHar:
+    def test_unfiltered_refused(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(_make_mock_daemon_for_har([]))
+        out = export_har(path=str(tmp_path / "x.har"))
+        assert "error" in out
+        assert "at least one" in out["error"]
+
+    def test_relative_path_refused(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(_make_mock_daemon_for_har([{"uid": "u1"}]))
+        out = export_har(path="rel.har", uids=["u1"])
+        assert "error" in out
+        assert "absolute" in out["error"]
+
+    def test_under_reqable_dir_refused(self) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(_make_mock_daemon_for_har([{"uid": "u1"}]))
+        bad = (
+            Path.home() / "Library" / "Application Support"
+            / "com.reqable.macosx" / "evil.har"
+        )
+        out = export_har(path=str(bad), uids=["u1"])
+        assert "error" in out
+        assert "Reqable's own data" in out["error"]
+
+    def test_limit_out_of_range(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(_make_mock_daemon_for_har([{"uid": "u1"}]))
+        for limit in (0, -1, 100_000):
+            out = export_har(
+                path=str(tmp_path / "x.har"), uids=["u1"], limit=limit
+            )
+            assert "error" in out
+            assert "limit" in out["error"]
+
+    def test_basic_export_one_capture(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://api.example.com/v1/login",
+                    "host": "api.example.com", "path": "/v1/login",
+                    "method": "POST", "status": 200,
+                    "ts": 1700000000000, "rtt_ms": 123,
+                    "protocol": "h2",
+                    "req_mime": "application/json",
+                    "res_mime": "application/json",
+                    "req_headers": [
+                        "host: api.example.com",
+                        "content-type: application/json",
+                    ],
+                    "res_headers": [
+                        "content-type: application/json",
+                        "content-length: 7",
+                    ],
+                    "status_message": "OK",
+                    "req_body": b'{"u":"a"}',
+                    "res_body": b'{"ok":1}',
+                    "req_body_size": 9,
+                    "res_body_size": 7,
+                }
+            ])
+        )
+        target = tmp_path / "out.har"
+        out = export_har(path=str(target), uids=["u1"])
+        assert "error" not in out, out
+        assert out["entry_count"] == 1
+        assert out["skipped_count"] == 0
+        har = json.loads(target.read_text())
+        assert har["log"]["version"] == "1.2"
+        assert har["log"]["creator"]["name"] == "reqable-mcp"
+        entry = har["log"]["entries"][0]
+        assert entry["request"]["method"] == "POST"
+        assert entry["request"]["url"] == "https://api.example.com/v1/login"
+        assert entry["request"]["httpVersion"] == "HTTP/2"
+        # postData populated for POST with body
+        assert entry["request"]["postData"]["mimeType"] == "application/json"
+        assert entry["request"]["postData"]["text"] == '{"u":"a"}'
+        assert entry["response"]["status"] == 200
+        assert entry["response"]["statusText"] == "OK"
+        assert entry["response"]["content"]["text"] == '{"ok":1}'
+        assert entry["timings"]["wait"] == 123
+        assert entry["time"] == 123
+
+    def test_querystring_extracted(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x.test/search?q=hello&page=2",
+                    "host": "x.test", "method": "GET", "status": 200,
+                }
+            ])
+        )
+        out = export_har(path=str(tmp_path / "qs.har"), uids=["u1"])
+        assert "error" not in out
+        har = json.loads((tmp_path / "qs.har").read_text())
+        qs = har["log"]["entries"][0]["request"]["queryString"]
+        assert {"name": "q", "value": "hello"} in qs
+        assert {"name": "page", "value": "2"} in qs
+
+    def test_redirect_url_from_location_header(
+        self, tmp_path: Path
+    ) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x.test/old",
+                    "host": "x.test", "method": "GET",
+                    "status": 302,
+                    "res_headers": ["Location: https://x.test/new"],
+                }
+            ])
+        )
+        export_har(path=str(tmp_path / "r.har"), uids=["u1"])
+        har = json.loads((tmp_path / "r.har").read_text())
+        assert (
+            har["log"]["entries"][0]["response"]["redirectURL"]
+            == "https://x.test/new"
+        )
+
+    def test_binary_response_body_base64(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x.test/img.png",
+                    "host": "x.test", "method": "GET",
+                    "status": 200,
+                    "res_mime": "image/png",
+                    "res_body": b"\x89PNG\r\n\x1a\n\xff\xfe\xfd",
+                }
+            ])
+        )
+        export_har(path=str(tmp_path / "bin.har"), uids=["u1"])
+        har = json.loads((tmp_path / "bin.har").read_text())
+        content = har["log"]["entries"][0]["response"]["content"]
+        assert content.get("encoding") == "base64"
+
+    def test_pseudo_headers_dropped(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x.test/",
+                    "host": "x.test", "method": "GET",
+                    "status": 200, "protocol": "h2",
+                    "req_headers": [
+                        ":method: GET",
+                        ":path: /",
+                        "host: x.test",
+                        "user-agent: test",
+                    ],
+                    "res_headers": [":status: 200", "x-real: 1"],
+                }
+            ])
+        )
+        export_har(path=str(tmp_path / "h2.har"), uids=["u1"])
+        har = json.loads((tmp_path / "h2.har").read_text())
+        entry = har["log"]["entries"][0]
+        names = [h["name"] for h in entry["request"]["headers"]]
+        assert ":method" not in names
+        assert ":path" not in names
+        assert "host" in names
+        res_names = [h["name"] for h in entry["response"]["headers"]]
+        assert ":status" not in res_names
+
+    def test_missing_capture_increments_skipped(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x.test/",
+                    "host": "x.test", "method": "GET", "status": 200,
+                }
+            ])
+        )
+        out = export_har(path=str(tmp_path / "skip.har"), uids=["u1", "missing"])
+        assert out["entry_count"] == 1
+        assert out["skipped_count"] == 1
+
+    def test_host_filter_uses_query_recent(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {"uid": "u1", "ob_id": 1, "url": "https://a/", "host": "a", "method": "GET", "status": 200},
+                {"uid": "u2", "ob_id": 2, "url": "https://b/", "host": "b", "method": "GET", "status": 200},
+            ])
+        )
+        out = export_har(path=str(tmp_path / "host.har"), host="a")
+        assert "error" not in out
+        har = json.loads((tmp_path / "host.har").read_text())
+        urls = [e["request"]["url"] for e in har["log"]["entries"]]
+        assert urls == ["https://a/"]
+
+    def test_iso_timestamp_format(self, tmp_path: Path) -> None:
+        from reqable_mcp.tools.export import export_har
+
+        set_daemon(
+            _make_mock_daemon_for_har([
+                {
+                    "uid": "u1", "ob_id": 1,
+                    "url": "https://x/",
+                    "host": "x", "method": "GET", "status": 200,
+                    "ts": 1700000000123,  # known epoch ms
+                }
+            ])
+        )
+        export_har(path=str(tmp_path / "ts.har"), uids=["u1"])
+        har = json.loads((tmp_path / "ts.har").read_text())
+        # Format: 2023-11-14T22:13:20.123Z
+        ts = har["log"]["entries"][0]["startedDateTime"]
+        assert ts.endswith(".123Z")
+        assert ts.startswith("2023-")
