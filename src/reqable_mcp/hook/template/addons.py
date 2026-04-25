@@ -132,6 +132,31 @@ def _store_relay(name: str, value: str, ttl_seconds: int) -> bool:
     return bool(resp and resp.get("ok"))
 
 
+def _report_dry_run(rule_id: str, context, msg, side: str) -> None:
+    """Tell the daemon a dry-run rule matched. Fire-and-forget; an
+    IPC failure here doesn't break the request."""
+    if not rule_id:
+        return
+    if side == "request":
+        method = getattr(msg, "method", "")
+        path = getattr(msg, "path", "")
+    else:
+        req = getattr(msg, "request", None)
+        method = getattr(req, "method", "") if req is not None else ""
+        path = getattr(req, "path", "") if req is not None else ""
+    _ipc_call(
+        "report_dry_run",
+        {
+            "rule_id": rule_id,
+            "uid": context.uid,
+            "host": context.host,
+            "path": path,
+            "method": method,
+            "side": side,
+        },
+    )
+
+
 def _get_relay(name: str) -> str | None:
     """Fetch a stored relay value. Returns None on miss / IPC failure."""
     resp = _ipc_call("get_relay_value", {"name": name})
@@ -380,7 +405,18 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
 
     Each kind silently no-ops on shape errors — addons must not raise
     in production paths or it'll abort the request.
+
+    Dry-run short-circuit: if ``rule["dry_run"]`` is truthy we record
+    the match (so the operator can see "would have triggered") and
+    return True for hit-counting purposes, but skip the actual
+    mutation. Block rules are *also* dry-runnable: see
+    ``onRequest`` — it consults ``dry_run`` before raising.
     """
+    if rule.get("dry_run"):
+        rid = rule.get("id")
+        if isinstance(rid, str):
+            _report_dry_run(rid, context, msg, side)
+        return True
     kind = rule.get("kind")
     try:
         if kind == "tag":
@@ -487,22 +523,43 @@ def onRequest(context, request):
     # to be aborted — those edits would never reach upstream and
     # would just inflate hit counts of rules that had no effect.
     block_rules = [r for r in rules if r.get("kind") == "block"]
-    if block_rules:
+    # Separate dry-run block matches from real ones — dry-run blocks
+    # must NOT abort, just log and let traffic through.
+    real_blocks = [r for r in block_rules if not r.get("dry_run")]
+    dry_blocks = [r for r in block_rules if r.get("dry_run")]
+    for r in dry_blocks:
+        rid = r.get("id")
+        if isinstance(rid, str):
+            _report_dry_run(rid, context, request, "request")
+    if real_blocks:
         block_hits = [
-            r["id"] for r in block_rules if isinstance(r.get("id"), str)
+            r["id"] for r in real_blocks if isinstance(r.get("id"), str)
         ]
+        # Also credit dry-run blocks with hit counts (they matched).
+        for r in dry_blocks:
+            rid = r.get("id")
+            if isinstance(rid, str):
+                block_hits.append(rid)
         _report_hits("request", context, block_hits)
         raise RuntimeError(
             f"reqable-mcp blocked by rule "
-            f"{block_rules[0].get('id', '?')}"
+            f"{real_blocks[0].get('id', '?')}"
         )
+    # No real block: dry-run blocks still count as hits.
+    if dry_blocks:
+        dry_hits = [
+            r["id"] for r in dry_blocks if isinstance(r.get("id"), str)
+        ]
+        _report_hits("request", context, dry_hits)
     # Stable, semantically-meaningful apply order — see the comment
     # on ``_REQUEST_KIND_ORDER``. Sorted is stable, so equal-priority
     # rules retain the order the daemon sent them (block-first,
-    # ascending size).
-    rules.sort(key=_sort_key_request)
+    # ascending size). Block rules were fully handled above (real
+    # raised + dry-run logged + hits credited); skip them here.
+    non_block = [r for r in rules if r.get("kind") != "block"]
+    non_block.sort(key=_sort_key_request)
     hits: list[str] = []
-    for r in rules:
+    for r in non_block:
         if _apply_rule(r, context, request, "request"):
             rid = r.get("id")
             if isinstance(rid, str):

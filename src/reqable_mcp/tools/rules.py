@@ -57,6 +57,7 @@ def _serialize_rule(r: Rule) -> dict[str, Any]:
         "created_ts": r.created_ts,
         "expires_ts": r.expires_ts,
         "hits": r.hits,
+        "dry_run": r.dry_run,
     }
 
 
@@ -163,6 +164,7 @@ def inject_header(
     method: str | None = None,
     side: Literal["request", "response"] = "request",
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Add or override a header on matching live traffic.
 
@@ -194,6 +196,7 @@ def inject_header(
             method=method,
             payload={"name": name, "value": value},
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -242,6 +245,61 @@ def clear_rules() -> dict[str, Any]:
     if engine is None:
         return {"error": "rule engine not available"}
     return {"cleared": engine.clear()}
+
+
+# ---------------------------------------------------------------- ttl_limits
+
+
+# ---------------------------------------------------------------- dry_run_log
+
+
+@mcp.tool()
+def dry_run_log(
+    rule_id: str | None = None, limit: int = 64
+) -> dict[str, Any]:
+    """Inspect dry-run match history.
+
+    When a rule has ``dry_run=True``, the addons hook records every
+    match instead of mutating the message. Use this tool to see which
+    captures would have been touched — newest first — before flipping
+    the rule to live.
+
+    Pass ``rule_id`` to fetch one rule's log; omit it for a summary
+    of how many entries each rule has.
+
+    Returns ``{rule_id, entries[ts, uid, host, path, method, side]}``
+    when a ``rule_id`` is given, or ``{by_rule: {rule_id: count}}``
+    for the summary form.
+    """
+    daemon = get_daemon()
+    if daemon.dry_run_log is None:
+        return {"error": "dry-run log not available"}
+    if rule_id is None:
+        return {"by_rule": daemon.dry_run_log.fetch_all()}
+    if not isinstance(limit, int) or limit <= 0 or limit > 256:
+        return {"error": "limit must be int in (0, 256]"}
+    entries = daemon.dry_run_log.fetch(rule_id, limit=limit)
+    return {
+        "rule_id": rule_id,
+        "entries": [
+            {
+                "ts": e.ts, "uid": e.uid, "host": e.host,
+                "path": e.path, "method": e.method, "side": e.side,
+            }
+            for e in entries
+        ],
+    }
+
+
+@mcp.tool()
+def clear_dry_run_log(rule_id: str | None = None) -> dict[str, int]:
+    """Clear the dry-run log for a single rule, or for all rules if
+    ``rule_id`` is omitted. Returns ``{cleared: int}`` (entries dropped).
+    """
+    daemon = get_daemon()
+    if daemon.dry_run_log is None:
+        return {"cleared": 0}
+    return {"cleared": daemon.dry_run_log.clear(rule_id)}
 
 
 # ---------------------------------------------------------------- ttl_limits
@@ -325,6 +383,7 @@ def replace_body(
     method: str | None = None,
     side: Literal["request", "response"] = "request",
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Swap the entire request/response body on matching live traffic.
 
@@ -358,6 +417,7 @@ def replace_body(
             method=method,
             payload={"body": coerced},
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -377,6 +437,7 @@ def mock_response(
     path_pattern: str | None = None,
     method: str | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Fake the response the client sees — **upstream is still hit**.
 
@@ -437,6 +498,7 @@ def mock_response(
             method=method,
             payload=payload,
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -453,6 +515,7 @@ def block_request(
     path_pattern: str | None = None,
     method: str | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Abort matching requests before they reach the upstream.
 
@@ -503,6 +566,7 @@ def block_request(
             method=method,
             payload={},
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -556,6 +620,7 @@ def patch_body_field(
     method: str | None = None,
     side: Literal["request", "response"] = "request",
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Rewrite a single JSON field inside the body, leaving everything
     else intact.
@@ -599,6 +664,7 @@ def patch_body_field(
             method=method,
             payload={"field_path": field_path, "value": value},
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -659,6 +725,7 @@ def replace_body_regex(
     count: int = 0,
     flags: list[str] | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run ``re.sub(pattern, replacement, body)`` on matching traffic.
 
@@ -704,6 +771,7 @@ def replace_body_regex(
                 "flags": flags_int,
             },
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -730,6 +798,7 @@ def auto_token_relay(
     target_path_pattern: str | None = None,
     value_prefix: str = "",
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Capture a token from one host's response, inject it on another.
 
@@ -825,6 +894,7 @@ def auto_token_relay(
                 "ttl_seconds": ttl_seconds,
             },
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         return {"error": f"extract rule rejected: {e}"}
@@ -840,6 +910,7 @@ def auto_token_relay(
                 "value_prefix": value_prefix,
             },
             ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
         )
     except ValueError as e:
         # Last-resort rollback. Pre-validation should have caught

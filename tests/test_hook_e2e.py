@@ -803,6 +803,119 @@ def test_relay_extract_from_response_header(hook_setup) -> None:
     assert d.relay_store.get("csrf") == "abcdef"
 
 
+def test_dry_run_inject_header_does_not_apply(hook_setup) -> None:
+    """A dry-run inject_header rule MUST NOT actually add the header,
+    but it should record a dry_run log entry and credit the hit."""
+    d = hook_setup["daemon"]
+    rule = d.rule_engine.add(
+        kind="inject_header", side="request",
+        host="api.example.com",
+        payload={"name": "X-Should-Not-Apply", "value": "nope"},
+        dry_run=True,
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    # Header was NOT added.
+    assert not any(
+        h.startswith("X-Should-Not-Apply") for h in cb["request"]["headers"]
+    )
+    time.sleep(0.05)
+    # But the rule was credited with a hit.
+    assert d.rule_engine.list_all()[0].hits == 1
+    # And the dry-run log holds an entry.
+    assert d.dry_run_log is not None
+    entries = d.dry_run_log.fetch(rule.id)
+    assert len(entries) == 1
+    assert entries[0].host == "api.example.com"
+    assert entries[0].path == "/v1/login"
+    assert entries[0].method == "POST"
+    assert entries[0].side == "request"
+
+
+def test_dry_run_block_does_not_abort(hook_setup) -> None:
+    """A dry-run block rule must NOT raise — traffic flows through,
+    but the daemon records the would-be abort."""
+    d = hook_setup["daemon"]
+    rule = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        payload={},
+        dry_run=True,
+    )
+    res = _run_hook_raw(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    # Process exited successfully — block was suppressed.
+    assert res.returncode == 0
+    cb_path = hook_setup["hook_dir"] / "request.bin.cb"
+    assert cb_path.exists()
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 1
+    assert d.dry_run_log is not None
+    assert len(d.dry_run_log.fetch(rule.id)) == 1
+
+
+def test_dry_run_replace_body_does_not_mutate(hook_setup) -> None:
+    """A dry-run replace_body must leave the body byte-identical."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {**SAMPLE_REQUEST["context"]},  # type: ignore[arg-type]
+        "request": {
+            **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+            "body": {
+                "type": 1,
+                "payload": {"text": "ORIGINAL", "charset": "UTF-8"},
+            },
+        },
+    }
+    d.rule_engine.add(
+        kind="replace_body", side="request",
+        host="api.example.com",
+        payload={"body": "REPLACED"},
+        dry_run=True,
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", sample,
+        socket_path=hook_setup["socket"],
+    )
+    # Body unchanged.
+    assert cb["request"]["body"]["payload"]["text"] == "ORIGINAL"
+    time.sleep(0.05)
+    assert d.dry_run_log is not None
+    assert d.dry_run_log.stats()["total_entries"] == 1
+
+
+def test_dry_run_block_coexists_with_real_block(hook_setup) -> None:
+    """If both a real block and a dry-run block match, the real one
+    still aborts, but the dry-run one is also credited with a hit."""
+    d = hook_setup["daemon"]
+    real = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com",
+        payload={},
+    )
+    dry = d.rule_engine.add(
+        kind="block", side="request",
+        host="api.example.com", path_pattern="/v1",
+        payload={},
+        dry_run=True,
+    )
+    res = _run_hook_raw(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    assert res.returncode != 0
+    time.sleep(0.05)
+    by_id = {r.id: r for r in d.rule_engine.list_all()}
+    assert by_id[real.id].hits == 1
+    assert by_id[dry.id].hits == 1
+    assert d.dry_run_log is not None
+    assert len(d.dry_run_log.fetch(dry.id)) == 1
+
+
 def test_addons_fail_open_when_daemon_unreachable(short_root: Path) -> None:
     """If the socket doesn't exist, addons must pass the request
     through unchanged — we never break user traffic."""

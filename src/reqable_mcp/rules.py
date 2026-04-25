@@ -99,6 +99,13 @@ class Rule:
     created_ts: float
     expires_ts: float | None
     hits: int = 0
+    # dry_run=True turns off the mutation half of every rule kind: the
+    # addons hook still records that the rule matched (it bumps hits
+    # and reports a structured "would have done X" event the operator
+    # can fetch via ``dry_run_log``), but the in-flight message is left
+    # untouched. Critical for vetting a regex / path_pattern before
+    # letting it really rewrite traffic.
+    dry_run: bool = False
     _path_re: re.Pattern[str] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -127,6 +134,8 @@ class Rule:
     def to_addon_payload(self) -> dict[str, Any]:
         """Shape sent down to addons.py — id + kind + payload, no metadata."""
         out: dict[str, Any] = {"id": self.id, "kind": self.kind}
+        if self.dry_run:
+            out["dry_run"] = True
         out.update(self.payload)
         return out
 
@@ -150,6 +159,7 @@ class Rule:
         "created_ts": (int, float),
         "expires_ts": (int, float, type(None)),
         "hits": int,
+        "dry_run": bool,
     }
 
     @classmethod
@@ -259,6 +269,7 @@ class RuleEngine:
         path_pattern: str | None = None,
         method: str | None = None,
         ttl_seconds: int | None = DEFAULT_TTL_SECONDS,
+        dry_run: bool = False,
     ) -> Rule:
         if kind not in VALID_KINDS:
             raise ValueError(f"invalid kind {kind!r}; must be one of {sorted(VALID_KINDS)}")
@@ -284,6 +295,7 @@ class RuleEngine:
             payload=dict(payload),
             created_ts=time.time(),
             expires_ts=expires,
+            dry_run=bool(dry_run),
         )
         with self._lock:
             self._rules[rule.id] = rule

@@ -933,3 +933,88 @@ class TestReplaceBodyRegex:
         assert "rule_id" in out
         assert daemon.rule_engine is not None
         assert daemon.rule_engine.list_all()[0].side == "response"
+
+
+# ---------------------------------------------------------------- dry_run plumbing
+
+
+class TestDryRunPlumbing:
+    def test_dry_run_flag_persists(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import replace_body
+
+        out = replace_body(body="x", host="api.x", dry_run=True)
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        rule = daemon.rule_engine.list_all()[0]
+        assert rule.dry_run is True
+
+    def test_dry_run_in_addon_payload(self, daemon: Daemon) -> None:
+        """The wire shape sent to addons must carry dry_run=True so
+        the hook can short-circuit. dry_run=False stays out of the
+        payload to keep frames small."""
+        from reqable_mcp.tools.rules import replace_body
+
+        out_dry = replace_body(body="x", host="a", dry_run=True)
+        out_live = replace_body(body="y", host="b", dry_run=False)
+        assert daemon.rule_engine is not None
+        rules = {r.id: r for r in daemon.rule_engine.list_all()}
+        dry_payload = rules[out_dry["rule_id"]].to_addon_payload()
+        live_payload = rules[out_live["rule_id"]].to_addon_payload()
+        assert dry_payload.get("dry_run") is True
+        assert "dry_run" not in live_payload
+
+    def test_dry_run_log_summary(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import dry_run_log
+
+        out = dry_run_log()
+        assert "by_rule" in out
+
+    def test_dry_run_log_specific_rule(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import dry_run_log
+
+        # No entries yet — should return empty list under "entries".
+        assert daemon.dry_run_log is not None
+        out = dry_run_log(rule_id="missing-rule")
+        assert out == {"rule_id": "missing-rule", "entries": []}
+
+    def test_dry_run_log_limit_validated(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import dry_run_log
+
+        out = dry_run_log(rule_id="x", limit=0)
+        assert "error" in out
+        out = dry_run_log(rule_id="x", limit=999)
+        assert "error" in out
+
+    def test_clear_dry_run_log(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import clear_dry_run_log
+
+        assert daemon.dry_run_log is not None
+        daemon.dry_run_log.record(
+            rule_id="r", uid="u", host="x", path="/",
+            method="GET", side="request",
+        )
+        out = clear_dry_run_log("r")
+        assert out == {"cleared": 1}
+        # Subsequent clear is a no-op.
+        out2 = clear_dry_run_log("r")
+        assert out2 == {"cleared": 0}
+
+    def test_clear_dry_run_log_all(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import clear_dry_run_log
+
+        assert daemon.dry_run_log is not None
+        for rid in ("a", "b"):
+            daemon.dry_run_log.record(
+                rule_id=rid, uid="u", host="x", path="/",
+                method="GET", side="request",
+            )
+        out = clear_dry_run_log()
+        assert out == {"cleared": 2}
+
+    def test_block_request_supports_dry_run(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import block_request
+
+        out = block_request(host="bad.test", dry_run=True)
+        assert "rule_id" in out
+        assert daemon.rule_engine is not None
+        assert daemon.rule_engine.list_all()[0].dry_run is True

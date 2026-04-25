@@ -21,6 +21,7 @@ import lmdb
 
 from . import proxy_guard
 from .db import Database
+from .dry_run import DryRunLog
 from .ipc.protocol import MAX_MESSAGE_BYTES, Request, error_response, ok_response
 from .ipc.server import IpcServer
 from .paths import Paths, resolve
@@ -82,6 +83,7 @@ class Daemon:
         self.wait_queue: WaitQueue | None = None
         self.rule_engine: RuleEngine | None = None
         self.relay_store: RelayStore | None = None
+        self.dry_run_log: DryRunLog | None = None
         self.ipc_server: IpcServer | None = None
         self.schema: dict[str, Entity] = {}
         self._started = False
@@ -150,6 +152,8 @@ class Daemon:
         # Phase 3: relay store backs auto_token_relay. Volatile by
         # design — restart wipes any stored tokens.
         self.relay_store = RelayStore()
+        # Phase 4: dry-run feedback log (volatile, ring-buffered).
+        self.dry_run_log = DryRunLog()
 
         if self.config.enable_ipc:
             self.ipc_server = IpcServer(
@@ -264,7 +268,27 @@ class Daemon:
         if req.op == "get_relay_value":
             return self._handle_get_relay(req.args)
 
+        if req.op == "report_dry_run":
+            return self._handle_report_dry_run(req.args)
+
         return error_response(f"unknown op: {req.op}")
+
+    def _handle_report_dry_run(self, args: dict) -> bytes:
+        if self.dry_run_log is None:
+            return error_response("dry-run log not started")
+        rule_id = args.get("rule_id")
+        if not isinstance(rule_id, str) or not rule_id:
+            return error_response("rule_id must be a non-empty string")
+        # Coerce to strings; addons may report unusual shapes.
+        self.dry_run_log.record(
+            rule_id=rule_id,
+            uid=str(args.get("uid", "")),
+            host=str(args.get("host", "")),
+            path=str(args.get("path", "")),
+            method=str(args.get("method", "")),
+            side=str(args.get("side", "")),
+        )
+        return ok_response({"recorded": True})
 
     def _handle_store_relay(self, args: dict) -> bytes:
         if self.relay_store is None:
@@ -376,6 +400,7 @@ class Daemon:
             "schema_entities": sorted(self.schema.keys()) if self.schema else [],
             "rules": self.rule_engine.stats() if self.rule_engine else None,
             "relay": self.relay_store.stats() if self.relay_store else None,
+            "dry_run": self.dry_run_log.stats() if self.dry_run_log else None,
             "ipc": self.ipc_server.stats() if self.ipc_server else None,
         }
 

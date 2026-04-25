@@ -269,6 +269,40 @@ def test_relay_store_validates_inputs(started_daemon: Daemon) -> None:
     assert resp["ok"] is False
 
 
+def test_dry_run_ipc_record(started_daemon: Daemon) -> None:
+    """``report_dry_run`` IPC verb stores an entry the tool can read."""
+    sock = started_daemon.paths.our_socket
+    resp = _round_trip(
+        sock,
+        {
+            "v": PROTOCOL_VERSION, "op": "report_dry_run",
+            "args": {
+                "rule_id": "abc", "uid": "u1",
+                "host": "x.example.com", "path": "/p",
+                "method": "GET", "side": "request",
+            },
+        },
+    )
+    assert resp == {"ok": True, "data": {"recorded": True}}
+    assert started_daemon.dry_run_log is not None
+    entries = started_daemon.dry_run_log.fetch("abc")
+    assert len(entries) == 1
+    assert entries[0].host == "x.example.com"
+
+
+def test_dry_run_ipc_validates_inputs(started_daemon: Daemon) -> None:
+    sock = started_daemon.paths.our_socket
+    resp = _round_trip(
+        sock,
+        {
+            "v": PROTOCOL_VERSION, "op": "report_dry_run",
+            "args": {"uid": "u"},
+        },
+    )
+    assert resp["ok"] is False
+    assert "rule_id" in resp["error"]
+
+
 def test_status_reports_ipc_and_rules(started_daemon: Daemon) -> None:
     assert started_daemon.rule_engine is not None
     started_daemon.rule_engine.add(
