@@ -40,11 +40,16 @@ RuleKind = Literal[
     "replace_body",
     "mock",
     "block",
+    "relay_extract",
+    "relay_inject",
 ]
 RuleSide = Literal["request", "response"]
 
 VALID_KINDS: frozenset[str] = frozenset(
-    ("tag", "comment", "inject_header", "replace_body", "mock", "block")
+    (
+        "tag", "comment", "inject_header", "replace_body", "mock", "block",
+        "relay_extract", "relay_inject",
+    )
 )
 VALID_SIDES: frozenset[str] = frozenset(("request", "response"))
 
@@ -261,6 +266,10 @@ class RuleEngine:
             raise ValueError("kind='mock' must use side='response'")
         if kind == "block" and side != "request":
             raise ValueError("kind='block' must use side='request'")
+        if kind == "relay_extract" and side != "response":
+            raise ValueError("kind='relay_extract' must use side='response'")
+        if kind == "relay_inject" and side != "request":
+            raise ValueError("kind='relay_inject' must use side='request'")
         expires = _validated_ttl(ttl_seconds)
         rule = Rule(
             id=uuid.uuid4().hex,

@@ -508,4 +508,126 @@ def block_request(
     return {"rule_id": rule.id, "expires_at": rule.expires_ts}
 
 
+# ---------------------------------------------------------------- auto_token_relay
+# Tier 3 — registers two coupled rules to ferry a token from one
+# host's response onto a later request to another host.
+
+
+_VALID_SOURCE_LOCS = ("header", "json_body")
+
+
+@mcp.tool()
+def auto_token_relay(
+    source_host: str,
+    source_loc: Literal["header", "json_body"],
+    source_field: str,
+    target_host: str,
+    target_header: str,
+    name: str | None = None,
+    source_path_pattern: str | None = None,
+    target_path_pattern: str | None = None,
+    value_prefix: str = "",
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Capture a token from one host's response, inject it on another.
+
+    Common workflow: an LLM watches a login round-trip, sees the
+    server return a token in a JSON body, and wants every subsequent
+    API call to that backend to carry the token in an ``Authorization``
+    header — without manually copy-pasting between captures.
+
+    This installs **two** coupled rules:
+
+    1. ``relay_extract`` on ``source_host`` (response side): pull
+       ``source_field`` from either the response headers
+       (``source_loc="header"``) or the JSON body
+       (``source_loc="json_body"`` — supports dotted paths like
+       ``"data.access_token"``) and store it under ``name`` in the
+       daemon's volatile relay store.
+    2. ``relay_inject`` on ``target_host`` (request side): read the
+       stored value, optionally prepend ``value_prefix`` (e.g.
+       ``"Bearer "``), and set it as ``target_header`` on the outbound
+       request.
+
+    Both rules share ``ttl_seconds`` (default 300, max 3600). The
+    relay store itself is volatile — daemon restarts wipe it. If
+    ``name`` is omitted we synthesize one from
+    ``source_host:source_field`` so two simultaneous relays don't
+    collide.
+
+    Returns ``{relay_name, extract_rule_id, inject_rule_id, expires_at}``
+    or ``{error}``.
+    """
+    if not source_host:
+        return {"error": "source_host must be non-empty"}
+    if not target_host:
+        return {"error": "target_host must be non-empty"}
+    if source_loc not in _VALID_SOURCE_LOCS:
+        return {
+            "error": (
+                f"source_loc must be one of {_VALID_SOURCE_LOCS}, "
+                f"got {source_loc!r}"
+            )
+        }
+    if not isinstance(source_field, str) or not source_field:
+        return {"error": "source_field must be a non-empty string"}
+    if not isinstance(target_header, str) or not target_header:
+        return {"error": "target_header must be a non-empty string"}
+    if target_header.startswith(":"):
+        return {"error": "cannot inject pseudo-headers (h2 :method/:path/etc.)"}
+    if not isinstance(value_prefix, str):
+        return {"error": "value_prefix must be a string"}
+
+    relay_name = (
+        name
+        if (isinstance(name, str) and name)
+        else f"{source_host.lower()}:{source_field}"
+    )
+
+    engine = _engine_or_error()
+    if engine is None:
+        return {"error": "rule engine not available — daemon not fully started"}
+
+    try:
+        extract_rule = engine.add(
+            kind="relay_extract", side="response",
+            host=source_host,
+            path_pattern=source_path_pattern,
+            payload={
+                "name": relay_name,
+                "source_loc": source_loc,
+                "source_field": source_field,
+                "ttl_seconds": ttl_seconds,
+            },
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        return {"error": f"extract rule rejected: {e}"}
+
+    try:
+        inject_rule = engine.add(
+            kind="relay_inject", side="request",
+            host=target_host,
+            path_pattern=target_path_pattern,
+            payload={
+                "name": relay_name,
+                "target_header": target_header,
+                "value_prefix": value_prefix,
+            },
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as e:
+        # Roll back the extract side so we don't leave a half-installed
+        # relay quietly storing tokens nobody injects.
+        engine.remove(extract_rule.id)
+        return {"error": f"inject rule rejected: {e}"}
+
+    return {
+        "relay_name": relay_name,
+        "extract_rule_id": extract_rule.id,
+        "inject_rule_id": inject_rule.id,
+        "expires_at": extract_rule.expires_ts,
+    }
+
+
 __all__: list[str] = []  # tools register themselves via @mcp.tool

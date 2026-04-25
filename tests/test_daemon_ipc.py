@@ -223,6 +223,52 @@ def test_pack_rules_passthrough_under_budget(short_data_dir: Path) -> None:
     assert {p["id"] for p in packed} == {r1.id, r2.id}
 
 
+def test_relay_ipc_round_trip(started_daemon: Daemon) -> None:
+    """``store_relay_value`` then ``get_relay_value`` should round-trip."""
+    sock = started_daemon.paths.our_socket
+    resp = _round_trip(
+        sock,
+        {
+            "v": PROTOCOL_VERSION, "op": "store_relay_value",
+            "args": {"name": "tok", "value": "abc123", "ttl_seconds": 60},
+        },
+    )
+    assert resp == {"ok": True, "data": {"stored": True}}
+
+    resp = _round_trip(
+        sock,
+        {"v": PROTOCOL_VERSION, "op": "get_relay_value", "args": {"name": "tok"}},
+    )
+    assert resp == {"ok": True, "data": {"value": "abc123"}}
+
+
+def test_relay_get_missing_returns_null_value(started_daemon: Daemon) -> None:
+    resp = _round_trip(
+        started_daemon.paths.our_socket,
+        {"v": PROTOCOL_VERSION, "op": "get_relay_value", "args": {"name": "nope"}},
+    )
+    assert resp == {"ok": True, "data": {"value": None}}
+
+
+def test_relay_store_validates_inputs(started_daemon: Daemon) -> None:
+    sock = started_daemon.paths.our_socket
+    # missing name
+    resp = _round_trip(
+        sock,
+        {"v": PROTOCOL_VERSION, "op": "store_relay_value",
+         "args": {"value": "v", "ttl_seconds": 60}},
+    )
+    assert resp["ok"] is False
+
+    # ttl out of range
+    resp = _round_trip(
+        sock,
+        {"v": PROTOCOL_VERSION, "op": "store_relay_value",
+         "args": {"name": "k", "value": "v", "ttl_seconds": 99999}},
+    )
+    assert resp["ok"] is False
+
+
 def test_status_reports_ipc_and_rules(started_daemon: Daemon) -> None:
     assert started_daemon.rule_engine is not None
     started_daemon.rule_engine.add(

@@ -24,6 +24,7 @@ from .db import Database
 from .ipc.protocol import MAX_MESSAGE_BYTES, Request, error_response, ok_response
 from .ipc.server import IpcServer
 from .paths import Paths, resolve
+from .relay import MAX_RELAY_TTL_SECONDS, MAX_RELAY_VALUE_BYTES, RelayStore
 from .rules import Rule, RuleEngine
 from .sources.body_source import BodySource
 from .sources.lmdb_source import LmdbSource
@@ -80,6 +81,7 @@ class Daemon:
         self.lmdb_source: LmdbSource | None = None
         self.wait_queue: WaitQueue | None = None
         self.rule_engine: RuleEngine | None = None
+        self.relay_store: RelayStore | None = None
         self.ipc_server: IpcServer | None = None
         self.schema: dict[str, Entity] = {}
         self._started = False
@@ -145,6 +147,9 @@ class Daemon:
         # rules even without IPC; addons can't talk to us without IPC).
         # RuleEngine auto-loads on construction.
         self.rule_engine = RuleEngine(self.paths.our_rules_json)
+        # Phase 3: relay store backs auto_token_relay. Volatile by
+        # design — restart wipes any stored tokens.
+        self.relay_store = RelayStore()
 
         if self.config.enable_ipc:
             self.ipc_server = IpcServer(
@@ -197,23 +202,29 @@ class Daemon:
         log.info("reqable-mcp daemon stopped")
 
     def _reap_loop(self) -> None:
-        """Background loop: prune expired rules every
+        """Background loop: prune expired rules and relay tokens every
         :data:`RULE_REAP_INTERVAL_S` seconds. Stops when ``stop()``
         sets ``_reaper_stop`` (we use ``Event.wait`` so shutdown is
         responsive instead of sleeping the full interval).
         """
         interval = self.config.reap_interval_seconds
         while not self._reaper_stop.wait(timeout=interval):
-            engine = self.rule_engine
-            if engine is None:
-                continue
-            try:
-                dropped = engine.reap_expired()
-            except Exception:
-                log.exception("rule reaper failed")
-                continue
-            if dropped:
-                log.info("rule reaper dropped %d expired rule(s)", dropped)
+            if self.rule_engine is not None:
+                try:
+                    dropped = self.rule_engine.reap_expired()
+                except Exception:
+                    log.exception("rule reaper failed")
+                else:
+                    if dropped:
+                        log.info("rule reaper dropped %d expired rule(s)", dropped)
+            if self.relay_store is not None:
+                try:
+                    rel_dropped = self.relay_store.reap_expired()
+                except Exception:
+                    log.exception("relay reaper failed")
+                else:
+                    if rel_dropped:
+                        log.info("relay reaper dropped %d expired token(s)", rel_dropped)
 
     # ------------------------------------------------------------------ ipc
 
@@ -247,7 +258,46 @@ class Daemon:
                 self.rule_engine.record_hit(str(rid))
             return ok_response({})
 
+        if req.op == "store_relay_value":
+            return self._handle_store_relay(req.args)
+
+        if req.op == "get_relay_value":
+            return self._handle_get_relay(req.args)
+
         return error_response(f"unknown op: {req.op}")
+
+    def _handle_store_relay(self, args: dict) -> bytes:
+        if self.relay_store is None:
+            return error_response("relay store not started")
+        name = args.get("name")
+        value = args.get("value")
+        ttl = args.get("ttl_seconds", 300)
+        if not isinstance(name, str) or not name:
+            return error_response("name must be a non-empty string")
+        if not isinstance(value, str):
+            return error_response("value must be a string")
+        if not isinstance(ttl, int) or not (0 < ttl <= MAX_RELAY_TTL_SECONDS):
+            return error_response(
+                f"ttl_seconds must be int in (0, {MAX_RELAY_TTL_SECONDS}]"
+            )
+        if len(value.encode("utf-8")) > MAX_RELAY_VALUE_BYTES:
+            return error_response(
+                f"value exceeds MAX_RELAY_VALUE_BYTES={MAX_RELAY_VALUE_BYTES}"
+            )
+        try:
+            self.relay_store.set(name, value, ttl_seconds=ttl)
+        except (TypeError, ValueError) as e:
+            return error_response(str(e))
+        return ok_response({"stored": True})
+
+    def _handle_get_relay(self, args: dict) -> bytes:
+        if self.relay_store is None:
+            return error_response("relay store not started")
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            return error_response("name must be a non-empty string")
+        value = self.relay_store.get(name)
+        return ok_response({"value": value})
 
     @staticmethod
     def _pack_rules_for_ipc(
@@ -325,6 +375,7 @@ class Daemon:
             ),
             "schema_entities": sorted(self.schema.keys()) if self.schema else [],
             "rules": self.rule_engine.stats() if self.rule_engine else None,
+            "relay": self.relay_store.stats() if self.relay_store else None,
             "ipc": self.ipc_server.stats() if self.ipc_server else None,
         }
 

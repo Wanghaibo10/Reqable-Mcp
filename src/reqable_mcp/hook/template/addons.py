@@ -116,6 +116,70 @@ def _report_hits(side: str, context, hits: list[str]) -> None:
     )
 
 
+def _store_relay(name: str, value: str, ttl_seconds: int) -> None:
+    """Send an extracted token to the daemon's RelayStore."""
+    _ipc_call(
+        "store_relay_value",
+        {"name": name, "value": value, "ttl_seconds": ttl_seconds},
+    )
+
+
+def _get_relay(name: str) -> str | None:
+    """Fetch a stored relay value. Returns None on miss / IPC failure."""
+    resp = _ipc_call("get_relay_value", {"name": name})
+    if resp is None or not resp.get("ok"):
+        return None
+    data = resp.get("data") or {}
+    v = data.get("value")
+    return v if isinstance(v, str) else None
+
+
+def _extract_from_header(headers, field: str) -> str | None:
+    """Find a header by name (case-insensitive) on a Reqable HttpHeaders."""
+    if not isinstance(field, str) or not field:
+        return None
+    try:
+        v = headers[field]
+        return v if isinstance(v, str) else None
+    except Exception:  # noqa: BLE001 — Reqable headers raise on weird input
+        return None
+
+
+def _extract_from_json_body(body, dotted_path: str) -> str | None:
+    """Walk a dotted path through a JSON body. Returns str or None.
+
+    ``msg.body`` is a Reqable HttpBody. We jsonify() to get a dict if
+    the body is text, then index. Lists are supported via integer
+    components: ``data.items.0.token``.
+    """
+    if not dotted_path:
+        return None
+    try:
+        body.jsonify()  # noqa: F811 — Reqable HttpBody
+    except Exception:  # noqa: BLE001
+        return None
+    payload = body.payload
+    if not isinstance(payload, (dict, list)):
+        return None
+    cursor = payload
+    for part in dotted_path.split("."):
+        if isinstance(cursor, dict):
+            cursor = cursor.get(part)
+        elif isinstance(cursor, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return None
+            if not (0 <= idx < len(cursor)):
+                return None
+            cursor = cursor[idx]
+        else:
+            return None
+        if cursor is None:
+            return None
+    return cursor if isinstance(cursor, str) else None
+
+
 # Highlight enum mapping — Reqable's ``Highlight`` is an IntEnum
 # (none/red/yellow/green/blue/teal/strikethrough). We accept either
 # the lower-case name or the int directly.
@@ -164,6 +228,39 @@ def _apply_rule(rule: dict, context, msg, side: str) -> bool:
                     msg.headers[h] = v
             if "body" in rule and isinstance(rule["body"], (str, dict)):
                 msg.body = rule["body"]
+            return True
+        elif kind == "relay_extract" and side == "response":
+            relay_name = rule.get("name")
+            source_loc = rule.get("source_loc")
+            source_field = rule.get("source_field")
+            ttl = rule.get("ttl_seconds", 300)
+            if not (isinstance(relay_name, str) and isinstance(source_field, str)):
+                return False
+            extracted: str | None = None
+            if source_loc == "header":
+                # Pull from response headers (the response we just got).
+                extracted = _extract_from_header(msg.headers, source_field)
+            elif source_loc == "json_body":
+                extracted = _extract_from_json_body(msg.body, source_field)
+            if extracted is None:
+                return False
+            _store_relay(
+                relay_name, extracted,
+                int(ttl) if isinstance(ttl, int) else 300,
+            )
+            return True
+        elif kind == "relay_inject" and side == "request":
+            relay_name = rule.get("name")
+            target_header = rule.get("target_header")
+            value_prefix = rule.get("value_prefix", "")
+            if not (isinstance(relay_name, str) and isinstance(target_header, str)):
+                return False
+            value = _get_relay(relay_name)
+            if value is None:
+                return False
+            if isinstance(value_prefix, str) and value_prefix:
+                value = value_prefix + value
+            msg.headers[target_header] = value
             return True
         # ``block`` is handled by the caller (see onRequest) — it needs
         # the hit reported *before* the request is aborted.

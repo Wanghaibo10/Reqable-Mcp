@@ -602,6 +602,7 @@ def test_tools_handle_missing_engine(short_data_dir: Path) -> None:
     set_daemon(fake_daemon)
 
     from reqable_mcp.tools.rules import (
+        auto_token_relay,
         block_request,
         clear_rules,
         inject_header,
@@ -619,3 +620,102 @@ def test_tools_handle_missing_engine(short_data_dir: Path) -> None:
     assert "error" in replace_body(body="x", host="x")
     assert "error" in mock_response(status=200, host="x")
     assert "error" in block_request(host="x")
+    assert "error" in auto_token_relay(
+        source_host="a", source_loc="header", source_field="X",
+        target_host="b", target_header="Y",
+    )
+
+
+# ---------------------------------------------------------------- auto_token_relay
+
+
+class TestAutoTokenRelay:
+    def test_basic_install(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="login.example.com",
+            source_loc="json_body",
+            source_field="data.access_token",
+            target_host="api.example.com",
+            target_header="Authorization",
+            value_prefix="Bearer ",
+        )
+        assert "extract_rule_id" in out
+        assert "inject_rule_id" in out
+        assert daemon.rule_engine is not None
+        rules_now = daemon.rule_engine.list_all()
+        assert {r.kind for r in rules_now} == {"relay_extract", "relay_inject"}
+        # Default name composes from source_host + source_field.
+        assert out["relay_name"] == "login.example.com:data.access_token"
+        # Both rules know the relay name.
+        for r in rules_now:
+            assert r.payload["name"] == out["relay_name"]
+
+    def test_explicit_name_used(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X-Token",
+            target_host="b", target_header="X-Auth",
+            name="custom",
+        )
+        assert out["relay_name"] == "custom"
+
+    def test_invalid_source_loc(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="cookie",  # type: ignore[arg-type]
+            source_field="X", target_host="b", target_header="Y",
+        )
+        assert "error" in out
+        assert "source_loc" in out["error"]
+
+    def test_pseudo_target_header_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X",
+            target_host="b", target_header=":authority",
+        )
+        assert "error" in out
+        assert "pseudo-headers" in out["error"]
+
+    def test_empty_source_host_rejected(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="", source_loc="header", source_field="X",
+            target_host="b", target_header="Y",
+        )
+        assert "error" in out
+
+    def test_inject_rule_rejection_rolls_back_extract(
+        self, daemon: Daemon, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the second engine.add() rejects (e.g. corrupt regex on
+        target_path_pattern), the extract rule we just installed must
+        NOT linger — otherwise we'd silently store tokens nobody
+        injects."""
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X",
+            target_host="b", target_header="Y",
+            target_path_pattern="(unclosed",  # invalid regex
+        )
+        assert "error" in out
+        assert daemon.rule_engine is not None
+        # No half-installed extract rule.
+        assert daemon.rule_engine.list_all() == []
+
+    def test_invalid_path_pattern(self, daemon: Daemon) -> None:
+        from reqable_mcp.tools.rules import auto_token_relay
+
+        out = auto_token_relay(
+            source_host="a", source_loc="header", source_field="X",
+            target_host="b", target_header="Y",
+            source_path_pattern="(unclosed",
+        )
+        assert "error" in out

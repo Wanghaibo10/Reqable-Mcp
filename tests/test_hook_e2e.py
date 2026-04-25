@@ -381,6 +381,133 @@ def test_multiple_block_rules_all_record_hits(hook_setup) -> None:
     assert by_id[b2.id].hits == 1
 
 
+def test_relay_extract_then_inject(hook_setup) -> None:
+    """End-to-end: response on source host writes a token into the
+    relay store; subsequent request on target host pulls it back and
+    sets the configured header."""
+    d = hook_setup["daemon"]
+
+    # Build a response on the source host with a token in JSON body.
+    resp_sample = {
+        "context": {
+            **SAMPLE_RESPONSE["context"],  # type: ignore[arg-type]
+            "host": "login.example.com",
+        },
+        "response": {
+            "request": {
+                **SAMPLE_REQUEST["request"],  # type: ignore[arg-type]
+                "method": "POST",
+                "path": "/oauth/token",
+            },
+            "code": 200,
+            "message": "OK",
+            "protocol": "h2",
+            "headers": ["content-type: application/json"],
+            "body": {
+                "type": 1,
+                "payload": {
+                    "text": '{"data":{"access_token":"sek-rit-token"}}',
+                    "charset": "UTF-8",
+                },
+            },
+            "trailers": [],
+        },
+    }
+    d.rule_engine.add(
+        kind="relay_extract", side="response",
+        host="login.example.com",
+        payload={
+            "name": "auth",
+            "source_loc": "json_body",
+            "source_field": "data.access_token",
+            "ttl_seconds": 60,
+        },
+    )
+    _run_hook(
+        hook_setup["hook_dir"], "response", resp_sample,
+        socket_path=hook_setup["socket"],
+    )
+    time.sleep(0.05)
+    assert d.relay_store.get("auth") == "sek-rit-token"
+
+    # Now an outbound request to a different host: relay_inject
+    # should attach the token.
+    d.rule_engine.add(
+        kind="relay_inject", side="request",
+        host="api.example.com",
+        payload={
+            "name": "auth",
+            "target_header": "Authorization",
+            "value_prefix": "Bearer ",
+        },
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    assert any(
+        "Authorization: Bearer sek-rit-token" in h
+        for h in cb["request"]["headers"]
+    )
+
+
+def test_relay_inject_no_value_yet_does_nothing(hook_setup) -> None:
+    """If the relay store has no value, inject must no-op cleanly
+    (don't synthesize a header from thin air)."""
+    d = hook_setup["daemon"]
+    d.rule_engine.add(
+        kind="relay_inject", side="request",
+        host="api.example.com",
+        payload={"name": "auth", "target_header": "Authorization"},
+    )
+    cb = _run_hook(
+        hook_setup["hook_dir"], "request", SAMPLE_REQUEST,
+        socket_path=hook_setup["socket"],
+    )
+    # No Authorization header was added.
+    assert not any(h.lower().startswith("authorization:") for h in cb["request"]["headers"])
+    # And the rule didn't take a hit.
+    time.sleep(0.05)
+    assert d.rule_engine.list_all()[0].hits == 0
+
+
+def test_relay_extract_from_response_header(hook_setup) -> None:
+    """source_loc='header' pulls a token from a response header
+    (e.g. ``Set-Cookie`` or ``X-Token``)."""
+    d = hook_setup["daemon"]
+    sample = {
+        "context": {
+            **SAMPLE_RESPONSE["context"],  # type: ignore[arg-type]
+            "host": "login.example.com",
+        },
+        "response": {
+            "request": {**SAMPLE_REQUEST["request"]},  # type: ignore[arg-type]
+            "code": 200,
+            "message": "OK",
+            "protocol": "h2",
+            "headers": ["content-type: text/plain", "x-csrf-token: abcdef"],
+            "body": {"type": 0, "payload": None},
+            "trailers": [],
+        },
+    }
+    d.rule_engine.add(
+        kind="relay_extract", side="response",
+        host="login.example.com",
+        payload={
+            "name": "csrf",
+            "source_loc": "header",
+            "source_field": "X-Csrf-Token",
+            "ttl_seconds": 60,
+        },
+    )
+    _run_hook(
+        hook_setup["hook_dir"], "response", sample,
+        socket_path=hook_setup["socket"],
+    )
+    time.sleep(0.05)
+    assert d.relay_store.get("csrf") == "abcdef"
+
+
 def test_addons_fail_open_when_daemon_unreachable(short_root: Path) -> None:
     """If the socket doesn't exist, addons must pass the request
     through unchanged — we never break user traffic."""
