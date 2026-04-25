@@ -32,6 +32,13 @@ dev = [
   "ruff>=0.5",
   "mypy>=1.8",
 ]
+# Optional codecs for ``decode_body`` / ``prettify`` / ``dump_body``.
+# Without these the tools still work for gzip / deflate; brotli and
+# zstd are no-ops with a clean error.
+export = [
+  "brotli>=1",
+  "zstandard>=0.20",
+]
 
 [project.scripts]
 reqable-mcp = "reqable_mcp.__main__:main"
