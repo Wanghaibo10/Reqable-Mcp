@@ -58,18 +58,22 @@ class SystemProxyState:
 
         Reqable runs as a local mitm proxy. If the only enabled proxy is
         loopback, we treat that as "Reqable being itself" and don't warn.
+
+        ``enabled=True`` with a missing host string is treated as
+        non-loopback (i.e. unsafe) — better to warn the user than to
+        miss a real third-party proxy due to a parse miss.
         """
         if not self.any_enabled:
             return True
-        hosts = [
-            self.http_host if self.http_enabled else None,
-            self.https_host if self.https_enabled else None,
-            self.socks_host if self.socks_enabled else None,
+        pairs = [
+            (self.http_enabled, self.http_host),
+            (self.https_enabled, self.https_host),
+            (self.socks_enabled, self.socks_host),
         ]
-        for h in hosts:
-            if h is None:
+        for enabled, h in pairs:
+            if not enabled:
                 continue
-            if h not in ("127.0.0.1", "localhost", "::1"):
+            if h is None or h not in ("127.0.0.1", "localhost", "::1"):
                 return False
         return True
 

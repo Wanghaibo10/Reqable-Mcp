@@ -53,17 +53,24 @@ class Database:
 
     # ------------------------------------------------------------------ writer
 
-    def writer_connection(self) -> sqlite3.Connection:
-        """Long-lived connection for the LMDB writer thread.
+    @contextmanager
+    def writer_connection(self) -> Iterator[sqlite3.Connection]:
+        """Scoped connection for write paths.
 
-        Caller is responsible for closing it.
+        Used as ``with db.writer_connection() as c: ...``. The connection
+        is closed on exit (the bare ``sqlite3.Connection`` context-manager
+        only commits/rollbacks; it does NOT close — which would leak fds
+        on every poller batch).
         """
         c = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None)
         c.execute("PRAGMA journal_mode = WAL")
         c.execute("PRAGMA synchronous = NORMAL")
         c.execute("PRAGMA busy_timeout = 5000")
         c.row_factory = sqlite3.Row
-        return c
+        try:
+            yield c
+        finally:
+            c.close()
 
     def upsert_capture(self, c: sqlite3.Connection, record: dict[str, Any]) -> None:
         """Insert (or replace) one capture row.
@@ -119,12 +126,14 @@ class Database:
         method: str | None = None,
         status: int | None = None,
         app: str | None = None,
+        since_ts_ms: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if host is not None:
-            clauses.append("host = ?")
-            params.append(host)
+            # Reqable stores hosts lower-case; match both case variants.
+            clauses.append("LOWER(host) = ?")
+            params.append(host.lower())
         if method is not None:
             clauses.append("method = ?")
             params.append(method.upper())
@@ -134,6 +143,9 @@ class Database:
         if app is not None:
             clauses.append("app_name = ?")
             params.append(app)
+        if since_ts_ms is not None:
+            clauses.append("ts >= ?")
+            params.append(int(since_ts_ms))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM captures {where} ORDER BY ts DESC LIMIT ?"
         params.append(int(limit))

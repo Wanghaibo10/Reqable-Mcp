@@ -256,7 +256,7 @@ def to_curl(uid: str, multiline: bool = True) -> str:
     sess = full.get("session") or {}
     req = sess.get("request") or {}
     rl = req.get("requestLine") or {}
-    method = rl.get("method") or row.get("method") or "GET"
+    method = (rl.get("method") or row.get("method") or "GET").upper()
     headers: list[str] = req.get("headers") or []
 
     url = row.get("url") or ""
@@ -281,7 +281,7 @@ def to_curl(uid: str, multiline: bool = True) -> str:
     body = None
     if daemon.body_source is not None:
         lookup = lookup_from_record(full)
-        if lookup is not None and method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        if lookup is not None and method in ("POST", "PUT", "PATCH", "DELETE"):
             body = daemon.body_source.get_request_body(lookup)
 
     if body:

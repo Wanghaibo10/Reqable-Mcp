@@ -29,6 +29,7 @@ read connections. WAL mode keeps them out of each other's way.
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
 import json
 import logging
@@ -102,6 +103,10 @@ class LmdbSource:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._env: lmdb.Environment | None = None
+        # Guards lazy ``_env`` creation in ``fetch_record`` / ``scan_once``
+        # when called from MCP tool threads without ``start()`` having
+        # opened the env first (e.g. ``cmd_status`` or test fixtures).
+        self._env_lock = threading.Lock()
 
         ent = schema.get("CaptureRecordHistoryEntity")
         if ent is None:
@@ -162,16 +167,23 @@ class LmdbSource:
         Used by tests and by ``status`` command. The background thread
         calls this in a loop.
         """
-        if self._env is None:
-            self._env = lmdb.open(
-                str(self.lmdb_path),
-                readonly=True,
-                lock=False,
-                max_dbs=64,
-                subdir=True,
-                create=False,
-            )
+        self._ensure_env()
         return self._scan_once_unsafe()
+
+    def _ensure_env(self) -> None:
+        """Open ``_env`` if not yet open. Thread-safe (double-checked)."""
+        if self._env is not None:
+            return
+        with self._env_lock:
+            if self._env is None:
+                self._env = lmdb.open(
+                    str(self.lmdb_path),
+                    readonly=True,
+                    lock=False,
+                    max_dbs=64,
+                    subdir=True,
+                    create=False,
+                )
 
     # ------------------------------------------------------------------ random access
 
@@ -183,15 +195,8 @@ class LmdbSource:
         empirically the ObjectBox ids we care about all fit in 32
         bits — for safety we still try a 64-bit form on miss.
         """
-        if self._env is None:
-            self._env = lmdb.open(
-                str(self.lmdb_path),
-                readonly=True,
-                lock=False,
-                max_dbs=64,
-                subdir=True,
-                create=False,
-            )
+        self._ensure_env()
+        assert self._env is not None  # _ensure_env post-condition
         # Prefer 4-byte BE id (matches keys like 1800002c0018b8c7).
         candidates = [
             CAPTURE_KEY_PREFIX + ob_id.to_bytes(4, "big"),
@@ -224,22 +229,25 @@ class LmdbSource:
 
     def _run(self) -> None:
         idle_streak = 0
-        last_txnid = -1
+        last_txnid: int | None = None
         while not self._stop.is_set():
             try:
                 # Cheap read: only walk records when txnid actually moved.
-                cur_txnid = self._env.info()["last_txnid"] if self._env else -1
+                cur_txnid = self._env.info()["last_txnid"] if self._env else None
                 if cur_txnid != last_txnid:
                     n = self._scan_once_unsafe()
                     last_txnid = cur_txnid
-                    if n > 0:
-                        idle_streak = 0
-                    else:
-                        idle_streak += 1
+                    idle_streak = 0 if n > 0 else idle_streak + 1
                 else:
                     idle_streak += 1
             except Exception:
+                # Bump last_txnid to the current value so we don't replay
+                # the same broken txn every 250ms (would spam the log).
+                # If the underlying issue persists, idle backoff still grows.
                 log.exception("lmdb_source poll error")
+                with contextlib.suppress(Exception):
+                    if self._env is not None:
+                        last_txnid = self._env.info()["last_txnid"]
                 idle_streak += 1
             self.stats.polls += 1
             self.stats.last_poll_ts_ms = int(time.time() * 1000)
@@ -374,13 +382,10 @@ class LmdbSource:
         req_mime = _find_header(req.get("headers") or [], "content-type")
         res_mime = _find_header(res.get("headers") or [], "content-type")
 
-        # ts: use record-level (LMDB ms) if present, else session.timestamp (us)
-        ts_ms = ts_us if ts_us > 1e15 else ts_us  # LMDB stores ms-equivalent
-        # Actually, the Entity-level timestamp field is unix ms; session.timestamp
-        # is microseconds. We trust ts_us here as ms (Reqable uses Date type).
-        # If we receive a microsecond-scale value (>1e15) treat it as us → ms.
-        if ts_ms > 10**15:
-            ts_ms = ts_ms // 1000
+        # Entity-level timestamp is unix ms (Reqable Date type). On the off
+        # chance we get a microsecond-scale value (>1e15 ≈ year 5138 in ms),
+        # rescale to ms.
+        ts_ms = ts_us // 1000 if ts_us > 10**15 else ts_us
 
         summary = f"{method or '?'} {url[:160]} -> {status if status is not None else '?'}"
 

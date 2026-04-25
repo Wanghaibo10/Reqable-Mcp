@@ -73,10 +73,14 @@ def _import_all_tools() -> None:
     ):
         try:
             __import__(mod_name)
-        except ImportError:
-            log.debug("tools module not available: %s", mod_name)
         except Exception:
-            log.exception("loading %s failed; skipping", mod_name)
+            # Don't silently swallow — a missing tool module means the
+            # user gets a degraded server with no warning. Surface at
+            # warning level so it shows in the default log config.
+            log.warning(
+                "failed to load tool module %s; tools from it will be "
+                "unavailable", mod_name, exc_info=True,
+            )
 
 
 def run_stdio() -> None:

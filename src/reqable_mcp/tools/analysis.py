@@ -257,8 +257,7 @@ def extract_auth(host: str, window_minutes: int = 60) -> list[dict[str, Any]]:
         return []
 
     since = window_start_ms(window_minutes)
-    # No native ts > X filter; just use query_recent and clip below.
-    rows = [r for r in daemon.db.query_recent(host=host, limit=200) if r["ts"] >= since]
+    rows = daemon.db.query_recent(host=host, limit=500, since_ts_ms=since)
     out: list[dict[str, Any]] = []
     for row in rows:
         full = daemon.lmdb_source.fetch_record(int(row["ob_id"]))

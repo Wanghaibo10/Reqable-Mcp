@@ -120,28 +120,27 @@ class WaitQueue:
         Returns the number woken. Waiters that match are stamped with
         ``matched`` and signaled. ``wait()`` does the actual cleanup so
         a slow caller can still observe its match.
+
+        Currently called from a single producer thread (the LMDB
+        poller). The matched-stamping happens inside ``self._lock`` so
+        that if a future change introduces a second producer, the
+        first-writer-wins guarantee still holds.
         """
         woken = 0
-        # Snapshot under lock; trigger events outside lock to avoid
-        # any matcher-induced deadlocks.
         with self._lock:
-            candidates = [w for w in self._waiters.values() if w.matched is None]
-        for w in candidates:
-            try:
-                if not w.spec.matches(capture):
+            for w in list(self._waiters.values()):
+                if w.matched is not None:
                     continue
-            except Exception:
-                log.exception("waiter %s matcher raised", w.id)
-                with self._lock:
+                try:
+                    if not w.spec.matches(capture):
+                        continue
+                except Exception:
+                    log.exception("waiter %s matcher raised", w.id)
                     self._waiters.pop(w.id, None)
-                continue
-            # Race: another notify may have set matched concurrently.
-            # First-writer-wins semantics — only signal if we win.
-            if w.matched is not None:
-                continue
-            w.matched = capture
-            w.event.set()
-            woken += 1
+                    continue
+                w.matched = capture
+                w.event.set()
+                woken += 1
         return woken
 
     def wait(
