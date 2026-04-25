@@ -491,18 +491,87 @@ UserScriptTemplate 行,或绕过这个机制。
 
 ### M17 — 重放与导出
 
-依赖:M11(用 IPC 通知 hit?可选)
+依赖:M11(读 capture)、proxy_guard(防回环)
 
-- [ ] 17.1 `src/reqable_mcp/tools/replay.py`
-  - `replay_request(uid, modifications={...})` — stdlib `urllib.request`,严格设
-    `OpenerDirector` + `ProxyHandler({})` 旁路所有代理
-  - 返回新响应的 status / headers / body
-  - 不写回 LMDB(我们的 db 仍只读),仅返回给调用者
-- [ ] 17.2 `src/reqable_mcp/tools/export.py`
-  - `dump_body(uid, side="req"|"res", path)` — 写到本地文件
-  - `export_har(uids|host|window, path)` — HAR 1.2 格式
-  - `decode_body(uid, side)` — gzip/br/deflate/zstd 解码
-  - `prettify(uid, side)` — JSON / XML / HTML 格式化
+**M17.1 `replay_request` — 设计要点**
+
+签名:
+```python
+replay_request(
+    uid: str,
+    method: str | None = None,        # 覆盖原 method
+    url: str | None = None,           # 覆盖整 URL(含 query)
+    headers: dict[str, str] | None = None,  # case-insensitive 覆盖
+    body: str | dict | None = None,   # str / dict / None=保留原 body / ""=清空
+    timeout_seconds: float = 30.0,
+) -> dict
+```
+
+返回:`{status, status_message, headers (list[str]), body (str|base64), body_encoding, rtt_ms, url_actual}` 或 `{error}`。
+
+约束:
+- **proxy 旁路双保险**:`urllib.request.build_opener(ProxyHandler({}), HTTPSHandler())`,显式空 ProxyHandler,**不依赖 env**(虽然 daemon 启动时 scrub 了 NO_PROXY=*,显式更稳)
+- **不写 LMDB / 不写 SQLite**:replay 是只读的副作用动作,我们的库仍是 read-only
+- **headers 合并**:原 capture headers + 用户 overrides,case-insensitive,override 删 header 用 `value=""` 表示删
+- **body 处理**:
+  - `body=None` → 用原 capture 的 body(GET/HEAD 仍空)
+  - `body=""` → 清空 body
+  - `body=str` → 直接发,Content-Type 不动
+  - `body=dict` → `json.dumps()` + 自动设 `Content-Type: application/json` 如未指定
+  - 大小上限 `BODY_MAX_BYTES`(64KB)与 rule 共享
+- **响应 body**:UTF-8 解码失败回 base64,与 `_decode_body_text` 一致
+- **超时**:hardcap 60s,默认 30s。timeout 时返回 `{error: "timeout"}`
+- **HTTPS 证书**:用系统默认 CA(`ssl.create_default_context()`)。**不**绕 verify(replay 必须能验证目标证书,否则等于盲打)
+
+测试:
+- 起本地 `http.server.HTTPServer` 在随机端口,真打一次,断言收到正确 method/path/headers/body
+- 断言 ProxyHandler({}) 不走系统代理(set 一个假的 HTTP_PROXY env,replay 必须忽略)
+- 断言 `body=dict` 自动加 Content-Type
+- 断言原 headers 被透传,override 生效
+- 断言 capture 不存在时返回 `{error: "uid not found"}`
+- 断言 body 超 BODY_MAX_BYTES 拒
+- 断言 timeout
+
+- [ ] 17.1.1 `src/reqable_mcp/tools/replay.py`
+- [ ] 17.1.2 `mcp_server._import_all_tools` 加 `reqable_mcp.tools.replay`
+- [ ] 17.1.3 `tests/test_tools_replay.py`(本地 http.server fixture)
+
+---
+
+**M17.2 `decode_body` / `prettify` / `dump_body` — 设计要点**
+
+`decode_body(uid, side="response")`:
+- 拿 raw bytes(`get_request_body` 或 `get_response_raw`)
+- 看 `Content-Encoding` header,逐层解 `gzip`/`deflate`/`br`/`zstd`
+- 多个 encoding 用 `,` 分隔,从右往左剥(RFC 9110 §8.4)
+- 返回 `{decoded (str|base64), original_size, decoded_size, encoding_chain (list)}`
+- 缺 brotli/zstandard 包时,该 codec 返回 `{error: "br codec missing — pip install brotli"}`,不影响其他 codec
+
+`prettify(uid, side="response", format=None)`:
+- 先 decode_body(自动剥 Content-Encoding),再按 format 格式化
+- format auto-detect:
+  - `application/json` → `json.dumps(json.loads(s), indent=2, ensure_ascii=False)`
+  - `application/xml`/`text/xml` → `xml.dom.minidom.parseString(s).toprettyxml(indent="  ")`
+  - `text/html` → stdlib `html.parser` 简化(或保持原样,**不引入 BeautifulSoup**)
+  - 其他 → 原样返回
+- 显式 format 覆盖 detect
+
+`dump_body(uid, side, path)`:
+- path 必须绝对路径,且不在 `~/Library/Application Support/com.reqable.macosx/`(我们绝不写 Reqable 的目录)
+- 默认写解码后的 body(prefer_decoded=True),`?raw=true` 写 on-wire
+- 返回 `{path, size, encoding}`
+
+依赖:`pip install brotli zstandard` —— 写到 pyproject 的 optional `[export]` extra,默认不强制装
+
+- [ ] 17.2.1 `src/reqable_mcp/tools/export.py`
+- [ ] 17.2.2 pyproject `[project.optional-dependencies]` `export = ["brotli>=1", "zstandard>=0.20"]`
+- [ ] 17.2.3 测试:每个 codec 一组,覆盖缺包 fallback
+
+---
+
+**M17.3 `export_har` — 单独 batch**
+
+HAR 1.2 schema 不算大但实现繁。前面落地后单开。
 
 ### M18 — 自动 token 中继(SDK env 字段杀手锏)
 
